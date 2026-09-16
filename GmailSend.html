@@ -1,0 +1,240 @@
+<script>
+/**
+ * Minimal Gmail MIME + send helpers (ported from extension gmailSend/email).
+ * Used after /files/encrypt when user clicks Encrypt and send.
+ */
+(function (g) {
+  function escapeHtml(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function sanitizeHeaderValue(s) {
+    return String(s || "").replace(/[\r\n]+/g, " ").trim();
+  }
+
+  function buildEmailBodies(options) {
+    options = options || {};
+    var senderEmail = options.senderEmail || "";
+    var message = String(options.message || "").trim();
+    var hasAttachment = Boolean(options.hasAttachment);
+    var appUrl = options.appUrl
+      ? String(options.appUrl).replace(/\/$/, "")
+      : null;
+    var openUrl = appUrl ? appUrl + "/open-extension" : null;
+    var meta = options.mailMetadata || null;
+    var metaText = [
+      meta && meta.token ? "Metadata" : "",
+      (meta && meta.token) || "",
+      meta && meta.emailEnc ? "email: " + meta.emailEnc : "",
+      meta && meta.uuidEnc ? "uuid: " + meta.uuidEnc : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    var metaHtml = "";
+    if (meta && (meta.token || meta.emailEnc || meta.uuidEnc)) {
+      metaHtml =
+        '<div style="margin:16px 0 0 0;padding:12px 0 0 0;border-top:2px solid #0F766E;font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5">' +
+        '<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:700;color:#0F766E;margin:0 0 8px 0">Metadata</div>' +
+        (meta.token
+          ? '<div style="font-family:Consolas,\'Courier New\',monospace;font-size:12px;line-height:1.5;margin:0 0 4px 0;word-break:break-all">' +
+            escapeHtml(meta.token) +
+            "</div>"
+          : "") +
+        (meta.emailEnc
+          ? '<div style="font-family:Consolas,\'Courier New\',monospace;font-size:12px;line-height:1.5;margin:0 0 4px 0;word-break:break-all">email: ' +
+            escapeHtml(meta.emailEnc) +
+            "</div>"
+          : "") +
+        (meta.uuidEnc
+          ? '<div style="font-family:Consolas,\'Courier New\',monospace;font-size:12px;line-height:1.5;margin:0;word-break:break-all">uuid: ' +
+            escapeHtml(meta.uuidEnc) +
+            "</div>"
+          : "") +
+        "</div>";
+    }
+
+    var text = [
+      senderEmail + " sent you a secure file.",
+      "",
+      message ? "Message:\n" + message : "",
+      "",
+      message
+        ? "Open SecureDocShare → Decrypt → paste the Message above."
+        : "",
+      hasAttachment
+        ? "To open the file: Open SecureDocShare → Decrypt → Upload file."
+        : "",
+      openUrl ? "\nOpen extension: " + openUrl : "",
+      metaText ? "\n" + metaText : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    var html =
+      '<div style="font-size:16px">' +
+      escapeHtml(senderEmail) +
+      " sent you a secure email - This email will be decrypted by <b>Recipient Authorization Verification</b></div>" +
+      (message
+        ? '<p><b>Message (ciphertext):</b><br><span style="word-break:break-all;font-family:monospace;font-size:12px;color:green">' +
+          escapeHtml(message) +
+          "</span></p><p>Copy and paste the Message ciphertext above to decrypt the message</p>"
+        : "") +
+      (hasAttachment
+        ? "<p>The encrypted file is attached separately.</p>"
+        : "") +
+      "<ol><li>Open SecureDocShare</li><li>Login</li><li>Decrypt</li></ol>" +
+      (openUrl
+        ? '<p><a href="' +
+          escapeHtml(openUrl) +
+          '">Open SecureDocShare</a></p>'
+        : "") +
+      '<p style="color:gray">Only the recipient account can decrypt this file.</p>' +
+      metaHtml;
+
+    return { text: text, html: html };
+  }
+
+  function createMimeRfc822Blob(options) {
+    options = options || {};
+    var boundary = "SecureDocShareBoundary";
+    var parts = [
+      "From: " + sanitizeHeaderValue(options.from),
+      "To: " + sanitizeHeaderValue(options.to),
+      "Subject: " + sanitizeHeaderValue(options.subject || "Secure document"),
+      "MIME-Version: 1.0",
+      'Content-Type: multipart/mixed; boundary="' + boundary + '"',
+      "",
+      "--" + boundary,
+      'Content-Type: multipart/alternative; boundary="altBoundary"',
+      "",
+      "--altBoundary",
+      "Content-Type: text/plain; charset=UTF-8",
+      "",
+      options.text || "",
+      "",
+      "--altBoundary",
+      "Content-Type: text/html; charset=UTF-8",
+      "",
+      options.html || "",
+      "",
+      "--altBoundary--",
+    ];
+
+    var blobs = [parts.join("\r\n")];
+    var safeName = sanitizeHeaderValue(
+      options.attachmentName || "secure-package.securepdf",
+    );
+    var b64 = options.attachmentBase64
+      ? String(options.attachmentBase64).replace(/\s+/g, "")
+      : "";
+
+    if (b64) {
+      var chunked = b64.replace(/.{1,76}/g, "$&\r\n");
+      blobs.push(
+        [
+          "",
+          "--" + boundary,
+          'Content-Type: application/octet-stream; name="' + safeName + '"',
+          "Content-Transfer-Encoding: base64",
+          'Content-Disposition: attachment; filename="' + safeName + '"',
+          "",
+          chunked.trimEnd(),
+          "",
+          "--" + boundary + "--",
+          "",
+        ].join("\r\n"),
+      );
+    } else {
+      blobs.push("\r\n--" + boundary + "--\r\n");
+    }
+
+    return new Blob(blobs, { type: "message/rfc822" });
+  }
+
+  function sendEncryptedEmailViaGmail(options) {
+    options = options || {};
+    var accessToken = options.accessToken;
+    var from = options.from;
+    var to = options.to;
+    if (!accessToken) {
+      return Promise.reject(new Error("Gmail access token is required."));
+    }
+    if (!from || !to) {
+      return Promise.reject(new Error("Sender and recipient are required."));
+    }
+
+    var hasAttachment = Boolean(options.attachmentBase64);
+    var bodies = buildEmailBodies({
+      senderEmail: from,
+      message: options.message || "",
+      hasAttachment: hasAttachment,
+      appUrl: options.appUrl,
+      mailMetadata: options.mailMetadata || null,
+    });
+
+    var mimeBlob = createMimeRfc822Blob({
+      from: from,
+      to: to,
+      subject: options.subject || "Secure document",
+      text: bodies.text,
+      html: bodies.html,
+      attachmentName: options.attachmentName,
+      attachmentBase64: options.attachmentBase64 || null,
+    });
+
+    if (mimeBlob.size > 24.5 * 1024 * 1024) {
+      return Promise.reject(
+        new Error(
+          "Message is too large for Gmail after encryption. Use a smaller file.",
+        ),
+      );
+    }
+
+    if (typeof options.onProgress === "function") {
+      options.onProgress(
+        "Uploading to Gmail (" +
+          (mimeBlob.size / (1024 * 1024)).toFixed(1) +
+          " MB)…",
+      );
+    }
+
+    return fetch(
+      "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=media",
+      {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + accessToken,
+          "Content-Type": "message/rfc822",
+        },
+        body: mimeBlob,
+      },
+    ).then(function (res) {
+      if (res.ok) return true;
+      return res.text().then(function (errBody) {
+        if (res.status === 401 || res.status === 403) {
+          var err = new Error(
+            "Gmail access expired. Allow Gmail once from the Chrome extension, then try again.",
+          );
+          err.code = "GMAIL_NOT_CONNECTED";
+          throw err;
+        }
+        throw new Error(
+          "Gmail send failed (" +
+            res.status +
+            "): " +
+            (errBody || res.statusText),
+        );
+      });
+    });
+  }
+
+  g.buildSecureDocEmailBodies = buildEmailBodies;
+  g.createMimeRfc822Blob = createMimeRfc822Blob;
+  g.sendEncryptedEmailViaGmail = sendEncryptedEmailViaGmail;
+})(typeof globalThis !== "undefined" ? globalThis : window);
+
+</script>

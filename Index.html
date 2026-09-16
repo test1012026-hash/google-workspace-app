@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SecureDocShare — Workspace</title>
+    <?!= include('Stylesheet'); ?>
+  </head>
+  <body>
+    <div id="app-body" class="pane">
+
+      <!-- ── LOGIN / LOGOUT (same as Outlook) ── -->
+      <div id="auth-view">
+        <div class="header">
+          <img
+            class="app-logo"
+            src="https://admin-panel-amber-nine.vercel.app/securedoc/icon-128.png"
+            alt="SecureDocShare"
+            width="28"
+            height="28"
+          />
+          <h2>SecureDoc <span class="workspace-badge">Workspace</span></h2>
+        </div>
+        <div id="auth-logged-out">
+          <p class="hint" id="auth-mode-hint">
+            Login is required to encrypt or decrypt mail. Sign in here, or create an account.
+          </p>
+          <p class="hint" style="margin-top:8px">
+            <a id="login-web-link" href="https://admin-panel-amber-nine.vercel.app/login" target="_blank" rel="noopener">
+              Manage your profile
+            </a>
+          </p>
+          <h3 class="auth-title" id="auth-title">Log in</h3>
+          <div id="sso-buttons" class="sso-stack" aria-label="Sign in with a provider">
+            <button type="button" class="btn-sso" data-provider="google" id="btn-sso-google">
+              Continue with Google
+            </button>
+            <button type="button" class="btn-sso" data-provider="microsoft" id="btn-sso-microsoft">
+              Continue with Microsoft
+            </button>
+            <button type="button" class="btn-sso" data-provider="yahoo" id="btn-sso-yahoo">
+              Continue with Yahoo
+            </button>
+          </div>
+          <p class="auth-divider"><span>or</span></p>
+          <label class="label" for="login-email">Email</label>
+          <input id="login-email" class="input" type="email" autocomplete="username" />
+          <label class="label" for="login-password" style="margin-top:8px">Password</label>
+          <input id="login-password" class="input" type="password" autocomplete="current-password" />
+          <label id="terms-row" class="terms-check" style="display:none">
+            <input id="accept-terms" type="checkbox" />
+            <span>
+              I agree to the
+              <a id="terms-link" href="https://admin-panel-amber-nine.vercel.app/terms" target="_blank" rel="noopener noreferrer">
+                Terms &amp; Conditions
+              </a>
+            </span>
+          </label>
+          <div id="otp-row" style="display:none;margin-top:8px">
+            <label class="label" for="signup-otp">4-digit verification code</label>
+            <input
+              id="signup-otp"
+              class="input"
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              maxlength="4"
+              placeholder="••••"
+            />
+            <p class="hint" id="otp-hint" style="margin-top:6px"></p>
+            <button id="btn-resend-otp" class="btn-link" type="button">Resend code</button>
+          </div>
+          <button id="btn-login" class="btn-primary" style="margin-top:12px">Log in</button>
+          <button id="btn-toggle-auth-mode" class="btn-link" type="button">
+            Need an account? Sign up
+          </button>
+          <p class="status-error" id="login-error" style="display:none;margin-top:8px"></p>
+        </div>
+        <div id="auth-logged-in" style="display:none">
+          <p class="status-ok" id="auth-user-label" style="margin-top:4px">Signed in</p>
+          <p class="hint" id="auth-sub-label" style="margin-top:6px"></p>
+          <button id="btn-logout" class="btn-secondary" style="margin-top:8px">Sign out</button>
+        </div>
+      </div>
+
+      <!-- ── Mode switch (Workspace: Encrypt + Decrypt) ── -->
+      <div id="tools-wrap" style="display:none">
+        <div class="mode-tabs" role="tablist">
+          <button type="button" class="mode-tab active" id="tab-encrypt" data-mode="encrypt">Encrypt</button>
+          <button type="button" class="mode-tab" id="tab-decrypt" data-mode="decrypt">Decrypt</button>
+        </div>
+
+        <!-- ── ENCRYPT / SEND (same checks as Outlook Send + Chrome extension) ── -->
+        <div id="compose-view" class="encrypt-result">
+          <p class="hint" id="compose-hint">
+            Same as Outlook / Chrome Send: verifies login token and subscription, encrypts the mail, then sends via Gmail API (or prepares ciphertext if Gmail is not connected yet).
+          </p>
+          <label class="label" for="encrypt-to">Recipient email</label>
+          <input id="encrypt-to" class="input" type="email" placeholder="recipient@company.com" />
+
+          <label class="label" for="encrypt-subject" style="margin-top:8px">Subject</label>
+          <input id="encrypt-subject" class="input" type="text" placeholder="Optional subject" />
+
+          <label class="label" for="encrypt-message" style="margin-top:8px">Message</label>
+          <textarea id="encrypt-message" class="input" placeholder="Type the message to encrypt…"></textarea>
+
+          <label class="label" for="encrypt-file" style="margin-top:8px">File (optional — any type except admin-blocked)</label>
+          <input id="encrypt-file" class="input" type="file" />
+
+          <div class="btn-row" style="margin-top:12px">
+            <button id="btn-encrypt-send" class="btn-primary">Encrypt and send</button>
+            <button id="btn-encrypt" class="btn-secondary" type="button">Encrypt only</button>
+          </div>
+          <p class="hint" id="compose-status" style="margin-top:8px"></p>
+
+          <div id="encrypt-success" style="display:none" class="encrypt-result">
+            <p class="status-ok" id="encrypt-success-label">✔ Encrypted successfully</p>
+            <label class="label" for="encrypt-cipher-out">Message ciphertext</label>
+            <textarea id="encrypt-cipher-out" class="input" readonly></textarea>
+            <div class="btn-row">
+              <button type="button" id="btn-copy-cipher" class="btn-secondary">Copy ciphertext</button>
+              <a id="encrypt-download" class="btn-primary download-btn" style="display:none" download>
+                ⬇ Download encrypted file
+              </a>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── DECRYPT (Outlook read equivalent) ── -->
+        <div id="read-view" style="display:none" class="decrypt-tools">
+          <p class="hint">
+            Paste SecureDoc ciphertext from Gmail (same as Outlook decrypt), or upload a <code>.securepdf</code> / encrypted package.
+          </p>
+
+          <div id="decrypt-idle">
+            <label class="label" for="recipient-email">Your email (recipient)</label>
+            <input id="recipient-email" class="input" type="email" placeholder="you@company.com" />
+
+            <label class="label" for="message-cipher" style="margin-top:10px">Message ciphertext</label>
+            <textarea id="message-cipher" class="input" placeholder="Paste encrypted message text…"></textarea>
+
+            <label class="label" for="file-cipher" style="margin-top:10px">Encrypted file (optional)</label>
+            <input id="file-cipher" class="input" type="file" />
+
+            <button id="btn-decrypt" class="btn-primary" style="margin-top:12px">Decrypt Message</button>
+          </div>
+
+          <div id="decrypt-loading" style="display:none">
+            <div class="spinner"></div>
+            <p class="hint">Decrypting…</p>
+          </div>
+
+          <div id="decrypt-error" style="display:none">
+            <p class="status-error" id="error-msg"></p>
+            <button id="btn-retry" class="btn-secondary">Try Again</button>
+          </div>
+
+          <div id="decrypt-success" style="display:none">
+            <p class="status-ok" style="margin-top: 10px;">✔ Decrypted successfully</p>
+            <div id="message-section" style="display:none; margin-top: 10px;">
+              <p class="label">Message:</p>
+              <div id="decrypted-message" class="message-box"></div>
+            </div>
+            <div id="file-section" style="display:none">
+              <p class="label">Decrypted file</p>
+              <a id="download-link" class="btn-primary download-btn" download>
+                ⬇ Download File
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <p class="hint" id="auth-gate-hint">
+        Sign in above to use Encrypt and Decrypt — same login as the Outlook add-in.
+      </p>
+    </div>
+
+    <?!= include('Config'); ?>
+    <?!= include('Common'); ?>
+    <?!= include('GmailSend'); ?>
+    <?!= include('App'); ?>
+  </body>
+</html>

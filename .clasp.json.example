@@ -1,0 +1,8 @@
+{
+  "scriptId": "",
+  "rootDir": ".",
+  "scriptExtensions": [".js", ".gs"],
+  "htmlExtensions": [".html"],
+  "jsonExtensions": [".json"],
+  "filePushOrder": ["Code.js"]
+}

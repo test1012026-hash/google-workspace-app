@@ -1,0 +1,1151 @@
+<script>
+/**
+ * SecureDocShare Workspace UI — same login/logout/signup/SSO/encrypt/decrypt
+ * flow as outlook-tool taskpane (without Office.js).
+ */
+
+function apiBase() {
+  if (typeof SecureDocConfig !== "undefined" && SecureDocConfig.getApiBaseUrl) {
+    return SecureDocConfig.getApiBaseUrl();
+  }
+  return (
+    (typeof DEFAULT_API_BASE !== "undefined" && DEFAULT_API_BASE) ||
+    "https://server-nine-rosy.vercel.app/api"
+  );
+}
+
+var _authReady = false;
+var _authMode = "login";
+var _signupOtpSent = false;
+var _uiMode = "encrypt";
+var _sessionEmail = "";
+var _subscriptionActive = false;
+var _sessionToken = "";
+
+document.addEventListener("DOMContentLoaded", function () {
+  initAuthUi();
+  setAuthMode("login");
+  bindModeTabs();
+  bindEncryptUi();
+  bindDecryptUi();
+  refreshAuthState(function () {});
+});
+
+function setAuthMode(next) {
+  _authMode = next === "signup" ? "signup" : "login";
+  _signupOtpSent = false;
+  setLoginError("");
+
+  var title = document.getElementById("auth-title");
+  var hint = document.getElementById("auth-mode-hint");
+  var termsRow = document.getElementById("terms-row");
+  var termsLink = document.getElementById("terms-link");
+  var termsBox = document.getElementById("accept-terms");
+  var otpRow = document.getElementById("otp-row");
+  var otpEl = document.getElementById("signup-otp");
+  var otpHint = document.getElementById("otp-hint");
+  var btn = document.getElementById("btn-login");
+  var toggle = document.getElementById("btn-toggle-auth-mode");
+  var passEl = document.getElementById("login-password");
+
+  if (title) title.textContent = _authMode === "signup" ? "Sign up" : "Log in";
+  if (hint) {
+    hint.textContent =
+      _authMode === "signup"
+        ? "Create a SecureDoc account to encrypt and decrypt mail."
+        : "Login is required to encrypt or decrypt mail. Sign in here, or create an account.";
+  }
+  if (termsRow) termsRow.style.display = _authMode === "signup" ? "flex" : "none";
+  if (otpRow) otpRow.style.display = "none";
+  if (otpEl) otpEl.value = "";
+  if (otpHint) otpHint.textContent = "";
+  if (termsBox) termsBox.checked = false;
+  if (termsLink && typeof SecureDocConfig !== "undefined" && SecureDocConfig.getTermsUrl) {
+    termsLink.href = SecureDocConfig.getTermsUrl();
+  }
+  if (btn) {
+    btn.textContent =
+      _authMode === "signup" ? "Send verification code" : "Log in";
+    btn.disabled = false;
+  }
+  if (toggle) {
+    toggle.textContent =
+      _authMode === "signup"
+        ? "Already have an account? Log in"
+        : "Need an account? Sign up";
+  }
+  if (passEl) {
+    passEl.autocomplete =
+      _authMode === "signup" ? "new-password" : "current-password";
+  }
+}
+
+function initAuthUi() {
+  var link = document.getElementById("login-web-link");
+  if (link) {
+    link.href =
+      typeof getLoginWebUrl === "function"
+        ? getLoginWebUrl()
+        : "https://admin-panel-amber-nine.vercel.app/login";
+  }
+
+  var termsLink = document.getElementById("terms-link");
+  if (termsLink && typeof SecureDocConfig !== "undefined" && SecureDocConfig.getTermsUrl) {
+    termsLink.href = SecureDocConfig.getTermsUrl();
+  }
+
+  var btnLogin = document.getElementById("btn-login");
+  var btnLogout = document.getElementById("btn-logout");
+  var btnToggle = document.getElementById("btn-toggle-auth-mode");
+  var btnResendOtp = document.getElementById("btn-resend-otp");
+
+  if (btnToggle && !btnToggle.dataset.bound) {
+    btnToggle.dataset.bound = "1";
+    btnToggle.addEventListener("click", function () {
+      setAuthMode(_authMode === "login" ? "signup" : "login");
+    });
+  }
+  if (btnLogin && !btnLogin.dataset.bound) {
+    btnLogin.dataset.bound = "1";
+    btnLogin.addEventListener("click", onTaskpaneAuthSubmit);
+  }
+  if (btnResendOtp && !btnResendOtp.dataset.bound) {
+    btnResendOtp.dataset.bound = "1";
+    btnResendOtp.addEventListener("click", onResendSignupOtp);
+  }
+  if (btnLogout && !btnLogout.dataset.bound) {
+    btnLogout.dataset.bound = "1";
+    btnLogout.addEventListener("click", function () {
+      btnLogout.disabled = true;
+      var run =
+        typeof logoutSession === "function"
+          ? logoutSession({ apiBaseUrl: apiBase() })
+          : Promise.resolve(
+              typeof clearSession === "function" ? clearSession() : null
+            );
+      Promise.resolve(run)
+        .catch(function () {})
+        .then(function () {
+          btnLogout.disabled = false;
+          _sessionEmail = "";
+          _sessionToken = "";
+          _subscriptionActive = false;
+          syncSessionToAppsScript(null);
+          setAuthMode("login");
+          resetToolPanels();
+          refreshAuthState(function () {});
+        });
+    });
+  }
+
+  bindSsoButtons();
+  refreshSsoProviders();
+}
+
+function bindSsoButtons() {
+  var root = document.getElementById("sso-buttons");
+  if (!root || root.dataset.bound) return;
+  root.dataset.bound = "1";
+  root.addEventListener("click", function (ev) {
+    var btn =
+      ev.target && ev.target.closest
+        ? ev.target.closest("[data-provider]")
+        : null;
+    if (!btn) return;
+    onSsoClick({ currentTarget: btn });
+  });
+}
+
+function refreshSsoProviders() {
+  if (typeof fetchOAuthProviders !== "function") return;
+  fetchOAuthProviders({ apiBaseUrl: apiBase() })
+    .then(function (info) {
+      var list =
+        (info && info.providers) ||
+        (info && info.data && info.data.providers) ||
+        [];
+      var buttons = document.querySelectorAll("#sso-buttons .btn-sso");
+      for (var i = 0; i < buttons.length; i++) {
+        var p = buttons[i].getAttribute("data-provider");
+        buttons[i].style.display =
+          !list.length || list.indexOf(p) >= 0 ? "" : "none";
+      }
+    })
+    .catch(function () {});
+}
+
+function setSsoBusy(busy) {
+  var buttons = document.querySelectorAll("#sso-buttons .btn-sso");
+  for (var i = 0; i < buttons.length; i++) buttons[i].disabled = Boolean(busy);
+  var loginBtn = document.getElementById("btn-login");
+  if (loginBtn) loginBtn.disabled = Boolean(busy);
+}
+
+function onSsoClick(ev) {
+  var btn = ev.currentTarget;
+  var provider = btn && btn.getAttribute("data-provider");
+  if (!provider) return;
+  if (typeof loginWithOAuth !== "function") {
+    setLoginError("OAuth helper not loaded.");
+    return;
+  }
+  var isSignup = _authMode === "signup";
+  var termsBox = document.getElementById("accept-terms");
+  if (isSignup && (!termsBox || !termsBox.checked)) {
+    setLoginError("Accept Terms & Conditions to sign up.");
+    return;
+  }
+  setLoginError("");
+  setSsoBusy(true);
+  loginWithOAuth({
+    provider: provider,
+    intent: isSignup ? "signup" : "login",
+    acceptTerms: isSignup,
+    apiBaseUrl: apiBase(),
+  })
+    .then(function (res) {
+      setSsoBusy(false);
+      if (!res || !res.ok) {
+        setLoginError((res && res.error) || "SSO failed");
+        return;
+      }
+      refreshAuthState(function () {});
+    })
+    .catch(function (err) {
+      setSsoBusy(false);
+      setLoginError(err.message || String(err));
+    });
+}
+
+function setLoginError(msg) {
+  var el = document.getElementById("login-error");
+  if (!el) return;
+  if (!msg) {
+    el.style.display = "none";
+    el.textContent = "";
+    return;
+  }
+  el.style.display = "block";
+  el.textContent = msg;
+}
+
+function onResendSignupOtp() {
+  var emailEl = document.getElementById("login-email");
+  var termsBox = document.getElementById("accept-terms");
+  var email = emailEl ? String(emailEl.value || "").trim() : "";
+  if (!email) {
+    setLoginError("Enter email first.");
+    return;
+  }
+  if (!termsBox || !termsBox.checked) {
+    setLoginError("Accept Terms & Conditions.");
+    return;
+  }
+  if (typeof sendSignupOtp !== "function") {
+    setLoginError("Signup helper not loaded.");
+    return;
+  }
+  setLoginError("");
+  sendSignupOtp({
+    email: email,
+    acceptTerms: true,
+    apiBaseUrl: apiBase(),
+  }).then(function (res) {
+    var hint = document.getElementById("otp-hint");
+    if (!res || !res.ok) {
+      setLoginError((res && res.error) || "Could not resend code");
+      return;
+    }
+    if (hint) hint.textContent = "A new code was sent.";
+  });
+}
+
+function onTaskpaneAuthSubmit() {
+  var emailEl = document.getElementById("login-email");
+  var passEl = document.getElementById("login-password");
+  var termsBox = document.getElementById("accept-terms");
+  var otpEl = document.getElementById("signup-otp");
+  var email = emailEl ? String(emailEl.value || "").trim() : "";
+  var password = passEl ? String(passEl.value || "") : "";
+  var otp = otpEl ? String(otpEl.value || "").trim() : "";
+  var isSignup = _authMode === "signup";
+
+  if (!email || !password) {
+    setLoginError("Email and password are required.");
+    return;
+  }
+  if (isSignup && typeof signupWithPassword !== "function") {
+    setLoginError("Signup helper not loaded.");
+    return;
+  }
+  if (!isSignup && typeof loginWithPassword !== "function") {
+    setLoginError("Login helper not loaded.");
+    return;
+  }
+
+  var btn = document.getElementById("btn-login");
+  if (btn) btn.disabled = true;
+  setLoginError("");
+
+  function resetBtn() {
+    if (!btn) return;
+    btn.disabled = false;
+    btn.textContent = isSignup
+      ? _signupOtpSent
+        ? "Verify & sign up"
+        : "Send verification code"
+      : "Log in";
+  }
+
+  if (isSignup && !_signupOtpSent) {
+    if (!termsBox || !termsBox.checked) {
+      resetBtn();
+      setLoginError("Accept Terms & Conditions.");
+      return;
+    }
+    sendSignupOtp({
+      email: email,
+      acceptTerms: true,
+      apiBaseUrl: apiBase(),
+    })
+      .then(function (res) {
+        if (!res || !res.ok) {
+          resetBtn();
+          setLoginError((res && res.error) || "Could not send code");
+          return;
+        }
+        _signupOtpSent = true;
+        var otpRow = document.getElementById("otp-row");
+        var hint = document.getElementById("otp-hint");
+        if (otpRow) otpRow.style.display = "block";
+        if (hint) hint.textContent = "Enter the 4-digit code from your email.";
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "Verify & sign up";
+        }
+      })
+      .catch(function (err) {
+        resetBtn();
+        setLoginError(err.message || String(err));
+      });
+    return;
+  }
+
+  var run = isSignup
+    ? signupWithPassword({
+        email: email,
+        password: password,
+        otp: otp,
+        acceptTerms: true,
+        apiBaseUrl: apiBase(),
+      })
+    : loginWithPassword({
+        email: email,
+        password: password,
+        apiBaseUrl: apiBase(),
+      });
+
+  run
+    .then(function (res) {
+      resetBtn();
+      if (!res || !res.ok) {
+        setLoginError((res && res.error) || "Authentication failed");
+        return;
+      }
+      _signupOtpSent = false;
+      if (passEl) passEl.value = "";
+      if (otpEl) otpEl.value = "";
+      if (termsBox) termsBox.checked = false;
+      setAuthMode("login");
+      refreshAuthState(function () {});
+    })
+    .catch(function (err) {
+      resetBtn();
+      setLoginError(err.message || String(err));
+    });
+}
+
+function refreshAuthState(done) {
+  var loggedOut = document.getElementById("auth-logged-out");
+  var loggedIn = document.getElementById("auth-logged-in");
+  var label = document.getElementById("auth-user-label");
+  var tools = document.getElementById("tools-wrap");
+  var gate = document.getElementById("auth-gate-hint");
+  var recipient = document.getElementById("recipient-email");
+
+  function finish(ok, email, sub) {
+    _authReady = Boolean(ok);
+    _sessionEmail = ok ? email || "" : "";
+    if (!ok) {
+      _sessionToken = "";
+      _subscriptionActive = false;
+      syncSessionToAppsScript(null);
+    }
+    if (loggedOut) loggedOut.style.display = ok ? "none" : "block";
+    if (loggedIn) loggedIn.style.display = ok ? "block" : "none";
+    if (label) {
+      label.className = "status-ok";
+      label.textContent = ok
+        ? "Signed in as " + (email || "SecureDoc user")
+        : "Signed in";
+    }
+    updateSubscriptionLabel(ok ? sub : null);
+    if (tools) tools.style.display = ok ? "block" : "none";
+    if (gate) gate.style.display = ok ? "none" : "block";
+    if (ok && recipient && email && !recipient.value) {
+      recipient.value = email;
+    }
+    if (ok) setUiMode(_uiMode || "encrypt");
+    if (typeof done === "function") done(ok);
+  }
+
+  if (typeof ensureAuthSession !== "function") {
+    finish(false, null, null);
+    return;
+  }
+
+  ensureAuthSession({ apiBaseUrl: apiBase() }).then(function (auth) {
+    if (auth && auth.ok && auth.authenticated) {
+      var email = auth.email || (auth.data && auth.data.email) || null;
+      _sessionToken =
+        auth.token ||
+        (auth.data && auth.data.token) ||
+        (typeof getStoredSession === "function" &&
+          getStoredSession() &&
+          getStoredSession().token) ||
+        "";
+      var sub = auth.subscription || (auth.data && auth.data.subscription) || {};
+      _subscriptionActive = sub.subscriptionActive === true;
+      syncSessionToAppsScript({
+        token: _sessionToken,
+        email: email,
+        expiresAt: auth.expiresAt || (auth.data && auth.data.expiresAt),
+      });
+      if (typeof checkSenderSubscription === "function" && email) {
+        checkSenderSubscription({
+          apiBaseUrl: apiBase(),
+          email: email,
+        }).then(function (subRes) {
+          _subscriptionActive = Boolean(
+            subRes && subRes.ok && subRes.subscriptionActive
+          );
+          finish(true, email, subRes && subRes.ok ? subRes : sub);
+        });
+        return;
+      }
+      finish(true, email, sub);
+      return;
+    }
+    finish(false, null, null);
+  });
+}
+
+function syncSessionToAppsScript(session) {
+  try {
+    if (
+      typeof google === "undefined" ||
+      !google.script ||
+      !google.script.run ||
+      typeof google.script.run.saveWorkspaceSession !== "function"
+    ) {
+      return;
+    }
+    if (!session || !session.token) {
+      google.script.run.clearWorkspaceSession();
+      return;
+    }
+    google.script.run.saveWorkspaceSession({
+      token: session.token,
+      email: session.email || "",
+      expiresAt: session.expiresAt || null,
+    });
+  } catch (e) {}
+}
+
+/**
+ * Outlook/extension send gate: valid login token + active subscription.
+ */
+function requireAuthAndSubscription(done) {
+  if (typeof ensureAuthSession !== "function") {
+    done(false, "Auth helper not loaded.", null);
+    return;
+  }
+  ensureAuthSession({ apiBaseUrl: apiBase() }).then(function (auth) {
+    if (!auth || !auth.ok || !auth.authenticated) {
+      _authReady = false;
+      _subscriptionActive = false;
+      refreshAuthState();
+      done(
+        false,
+        (auth && auth.error) ||
+          (typeof loginRequiredMessage === "function"
+            ? loginRequiredMessage(
+                auth && auth.code === "TOKEN_EXPIRED"
+                  ? "Your session has expired."
+                  : "You are not logged in."
+              )
+            : "Login required."),
+        null
+      );
+      return;
+    }
+
+    _authReady = true;
+    _sessionEmail = auth.email || _sessionEmail;
+    _sessionToken =
+      auth.token ||
+      (auth.data && auth.data.token) ||
+      (typeof getStoredSession === "function" &&
+        getStoredSession() &&
+        getStoredSession().token) ||
+      "";
+
+    var sub = auth.subscription || (auth.data && auth.data.subscription) || {};
+    var active =
+      sub.subscriptionActive === true ||
+      (sub.subscriptionExpiresAt &&
+        new Date(sub.subscriptionExpiresAt).getTime() > Date.now());
+
+    // Prefer dedicated public subscription-check (same as Outlook OnMessageSend).
+    var check =
+      typeof checkSenderSubscription === "function"
+        ? checkSenderSubscription({
+            apiBaseUrl: apiBase(),
+            email: _sessionEmail,
+          })
+        : Promise.resolve({
+            ok: active,
+            subscriptionActive: active,
+          });
+
+    check.then(function (subRes) {
+      _subscriptionActive = Boolean(
+        subRes && subRes.ok && subRes.subscriptionActive
+      );
+      updateSubscriptionLabel(subRes || sub);
+      if (!_subscriptionActive) {
+        done(
+          false,
+          (subRes && subRes.error) ||
+            "Subscription expired or inactive. Subscribe to encrypt and send.",
+          auth
+        );
+        return;
+      }
+      syncSessionToAppsScript({
+        token: _sessionToken,
+        email: _sessionEmail,
+        expiresAt: auth.expiresAt || (auth.data && auth.data.expiresAt),
+      });
+      done(true, null, auth);
+    });
+  });
+}
+
+function updateSubscriptionLabel(sub) {
+  var el = document.getElementById("auth-sub-label");
+  if (!el) return;
+  if (!sub) {
+    el.textContent = "";
+    return;
+  }
+  if (sub.subscriptionActive) {
+    var days =
+      sub.subscriptionDaysLeft != null ? sub.subscriptionDaysLeft : null;
+    el.textContent =
+      days != null
+        ? "Subscription active · " + days + " day(s) left"
+        : "Subscription active";
+    el.className = "hint";
+  } else {
+    el.textContent =
+      sub.error ||
+      "Subscription inactive — encrypt/send blocked until renewed.";
+    el.className = "status-error";
+  }
+}
+
+function apiJson(path, options) {
+  options = options || {};
+  var headers = {
+    "Content-Type": "application/json",
+  };
+  if (options.token) {
+    headers.Authorization = "Bearer " + options.token;
+  }
+  return fetch(String(apiBase()).replace(/\/$/, "") + path, {
+    method: options.method || "GET",
+    headers: headers,
+    body: options.body != null ? JSON.stringify(options.body) : undefined,
+  }).then(function (res) {
+    return res.text().then(function (text) {
+      var data = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch (e) {
+        data = { error: text || res.statusText };
+      }
+      return { res: res, data: data || {} };
+    });
+  });
+}
+
+function requireAuthOrPrompt(done) {
+  if (typeof ensureAuthSession !== "function") {
+    done(false, "Auth helper not loaded.");
+    return;
+  }
+  ensureAuthSession({ apiBaseUrl: apiBase() }).then(function (auth) {
+    if (auth && auth.ok && auth.authenticated) {
+      _authReady = true;
+      _sessionEmail = auth.email || _sessionEmail;
+      _sessionToken =
+        auth.token ||
+        (auth.data && auth.data.token) ||
+        (typeof getStoredSession === "function" &&
+          getStoredSession() &&
+          getStoredSession().token) ||
+        _sessionToken;
+      syncSessionToAppsScript({
+        token: _sessionToken,
+        email: _sessionEmail,
+        expiresAt: auth.expiresAt || (auth.data && auth.data.expiresAt),
+      });
+      done(true, null);
+      return;
+    }
+    _authReady = false;
+    refreshAuthState();
+    done(
+      false,
+      (auth && auth.error) ||
+        (typeof loginRequiredMessage === "function"
+          ? loginRequiredMessage(
+              auth && auth.code === "TOKEN_EXPIRED"
+                ? "Your session has expired."
+                : "You are not logged in."
+            )
+          : "Login required.")
+    );
+  });
+}
+
+function bindModeTabs() {
+  var tabs = document.querySelectorAll(".mode-tab");
+  for (var i = 0; i < tabs.length; i++) {
+    if (tabs[i].dataset.bound) continue;
+    tabs[i].dataset.bound = "1";
+    tabs[i].addEventListener("click", function (ev) {
+      var mode = ev.currentTarget.getAttribute("data-mode");
+      setUiMode(mode);
+    });
+  }
+}
+
+function setUiMode(mode) {
+  _uiMode = mode === "decrypt" ? "decrypt" : "encrypt";
+  var tabEncrypt = document.getElementById("tab-encrypt");
+  var tabDecrypt = document.getElementById("tab-decrypt");
+  var compose = document.getElementById("compose-view");
+  var read = document.getElementById("read-view");
+  if (tabEncrypt) {
+    tabEncrypt.className =
+      "mode-tab" + (_uiMode === "encrypt" ? " active" : "");
+  }
+  if (tabDecrypt) {
+    tabDecrypt.className =
+      "mode-tab" + (_uiMode === "decrypt" ? " active" : "");
+  }
+  if (compose) compose.style.display = _uiMode === "encrypt" ? "flex" : "none";
+  if (read) read.style.display = _uiMode === "decrypt" ? "flex" : "none";
+}
+
+function setComposeStatus(msg) {
+  var status = document.getElementById("compose-status");
+  if (status) status.textContent = msg || "";
+}
+
+function bindEncryptUi() {
+  var btn = document.getElementById("btn-encrypt");
+  var btnSend = document.getElementById("btn-encrypt-send");
+  var copyBtn = document.getElementById("btn-copy-cipher");
+  if (btn && !btn.dataset.bound) {
+    btn.dataset.bound = "1";
+    btn.addEventListener("click", function () {
+      onEncryptClick({ send: false });
+    });
+  }
+  if (btnSend && !btnSend.dataset.bound) {
+    btnSend.dataset.bound = "1";
+    btnSend.addEventListener("click", function () {
+      onEncryptClick({ send: true });
+    });
+  }
+  if (copyBtn && !copyBtn.dataset.bound) {
+    copyBtn.dataset.bound = "1";
+    copyBtn.addEventListener("click", function () {
+      var out = document.getElementById("encrypt-cipher-out");
+      var text = out ? String(out.value || "") : "";
+      if (!text) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(
+          function () {
+            setComposeStatus("Ciphertext copied.");
+          },
+          function () {
+            out.select();
+            document.execCommand("copy");
+            setComposeStatus("Ciphertext copied.");
+          }
+        );
+      } else {
+        out.select();
+        document.execCommand("copy");
+        setComposeStatus("Ciphertext copied.");
+      }
+    });
+  }
+}
+
+function collectEncryptForm() {
+  var toEl = document.getElementById("encrypt-to");
+  var subEl = document.getElementById("encrypt-subject");
+  var msgEl = document.getElementById("encrypt-message");
+  var fileEl = document.getElementById("encrypt-file");
+  return {
+    to: toEl ? String(toEl.value || "").trim() : "",
+    subject: subEl ? String(subEl.value || "").trim() : "",
+    message: msgEl ? String(msgEl.value || "") : "",
+    file: fileEl && fileEl.files && fileEl.files[0] ? fileEl.files[0] : null,
+  };
+}
+
+function readFileAsBase64(file) {
+  return new Promise(function (resolve, reject) {
+    var reader = new FileReader();
+    reader.onload = function () {
+      var text = String(reader.result || "");
+      var comma = text.indexOf(",");
+      resolve(comma >= 0 ? text.slice(comma + 1) : text);
+    };
+    reader.onerror = function () {
+      reject(new Error("Could not read the file."));
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function setEncryptButtonsDisabled(disabled) {
+  var btn = document.getElementById("btn-encrypt");
+  var btnSend = document.getElementById("btn-encrypt-send");
+  if (btn) btn.disabled = Boolean(disabled);
+  if (btnSend) btnSend.disabled = Boolean(disabled);
+}
+
+/**
+ * Same pipeline as Chrome extension / Outlook send:
+ * login token → subscription → /files/encrypt → optional Gmail API send.
+ */
+function onEncryptClick(options) {
+  options = options || {};
+  var wantSend = options.send !== false;
+
+  requireAuthAndSubscription(function (ok, errMsg) {
+    if (!ok) {
+      setComposeStatus(errMsg || "Sign in with an active subscription to encrypt.");
+      return;
+    }
+
+    var form = collectEncryptForm();
+    if (!form.to) {
+      setComposeStatus("Recipient email is required.");
+      return;
+    }
+    if (!String(form.message || "").trim() && !form.file) {
+      setComposeStatus("Add a message or a file (or both).");
+      return;
+    }
+
+    var blockedCheck = form.file
+      ? apiJson("/public/file-policy", { method: "GET" }).then(function (out) {
+          var data = (out && out.data) || {};
+          var blocked = Array.isArray(data.blockedFileExtensions)
+            ? data.blockedFileExtensions
+            : [];
+          var name = String(form.file.name || "");
+          var dot = name.lastIndexOf(".");
+          var ext =
+            dot > 0
+              ? name
+                  .slice(dot + 1)
+                  .toLowerCase()
+                  .replace(/[^a-z0-9]/g, "")
+              : "";
+          if (ext && blocked.indexOf(ext) !== -1) {
+            throw new Error(
+              "." + ext + " files are blocked by admin and cannot be encrypted."
+            );
+          }
+        })
+      : Promise.resolve();
+
+    setEncryptButtonsDisabled(true);
+    hideEncryptSuccess();
+    setComposeStatus(
+      wantSend ? "Checking login & subscription, then encrypting…" : "Encrypting…"
+    );
+
+    blockedCheck
+      .then(function () {
+        return form.file
+          ? readFileAsBase64(form.file).then(function (b64) {
+              return {
+                fileBase64: b64,
+                fileName: form.file.name || "document.bin",
+                mimeType: form.file.type || "application/octet-stream",
+              };
+            })
+          : Promise.resolve({});
+      })
+      .then(function (fileParts) {
+        var payload = {
+          recipientEmail: form.to,
+          subject: form.subject,
+          message: form.message || "",
+        };
+        if (fileParts.fileBase64) {
+          payload.fileBase64 = fileParts.fileBase64;
+          payload.fileName = fileParts.fileName;
+          payload.mimeType = fileParts.mimeType;
+        }
+
+        // Authenticated encrypt (same as Chrome extension) — enforces sender subscription server-side.
+        return apiJson("/files/encrypt", {
+          method: "POST",
+          token: _sessionToken,
+          body: payload,
+        });
+      })
+      .then(function (out) {
+        var res = out.res;
+        var data = out.data || {};
+        if (!res.ok) {
+          var code = data.code || "";
+          if (code === "FILE_EXTENSION_BLOCKED") {
+            throw new Error(
+              data.error ||
+                "This file extension is blocked by admin and cannot be encrypted."
+            );
+          }
+          if (code === "SUBSCRIPTION_EXPIRED" || res.status === 403) {
+            throw new Error(
+              data.error ||
+                "Subscription expired. Renew to encrypt and send."
+            );
+          }
+          if (res.status === 401) {
+            throw new Error(
+              data.error || "Login required. Sign in again."
+            );
+          }
+          throw new Error(data.error || "Encrypt failed.");
+        }
+
+        var enc = {
+          ok: true,
+          encrypted: true,
+          messageCipherText: data.messageCipherText || null,
+          fileCipherText: data.fileCipherText || null,
+          attachment: data.attachment || null,
+          subject: data.subject || form.subject,
+          recipientUuid: data.recipientUuid || null,
+          recipientEmail: data.recipientEmail || form.to,
+          mailMetadata: data.mailMetadata || null,
+          contentKind: data.contentKind || null,
+        };
+        showEncryptSuccess(enc);
+
+        if (!wantSend) {
+          setEncryptButtonsDisabled(false);
+          setComposeStatus("Encrypted. Copy ciphertext into Gmail, or use Encrypt and send.");
+          return null;
+        }
+
+        setComposeStatus("Encrypt OK. Requesting Gmail send token…");
+        return apiJson("/auth/gmail/send-token", {
+          method: "POST",
+          token: _sessionToken,
+          body: {},
+        }).then(function (tokenOut) {
+          return { enc: enc, tokenOut: tokenOut, to: form.to };
+        });
+      })
+      .then(function (pack) {
+        if (!pack) return;
+
+        var tokenRes = pack.tokenOut.res;
+        var tokenData = pack.tokenOut.data || {};
+        if (!tokenRes.ok) {
+          showEncryptSuccess(pack.enc);
+          setEncryptButtonsDisabled(false);
+          setComposeStatus(
+            (tokenData.error || "Gmail not connected.") +
+              " Ciphertext is ready — allow Gmail once in the Chrome extension, then Encrypt and send again."
+          );
+          return;
+        }
+
+        var accessToken = tokenData.accessToken;
+        var from = tokenData.from || _sessionEmail;
+        var appUrl = tokenData.appUrl || "";
+        var enc = pack.enc;
+        var attachment = enc.attachment || {};
+
+        // Notify server send path (same as extension clientSend).
+        return apiJson("/files/send", {
+          method: "POST",
+          token: _sessionToken,
+          body: {
+            recipientEmail: pack.to,
+            recipientUuid: enc.recipientUuid,
+            subject: enc.subject,
+            message: enc.messageCipherText || "",
+            filename: attachment.fileName || "message.txt",
+            contentKind: enc.fileCipherText ? "file" : "message",
+            clientSend: true,
+          },
+        }).then(function () {
+          if (typeof sendEncryptedEmailViaGmail !== "function") {
+            throw new Error("Gmail send helper not loaded.");
+          }
+          setComposeStatus("Sending encrypted mail via Gmail…");
+          return sendEncryptedEmailViaGmail({
+            accessToken: accessToken,
+            from: from,
+            to: pack.to,
+            subject: enc.subject,
+            message: enc.messageCipherText || "",
+            attachmentName: attachment.fileName,
+            attachmentBase64:
+              attachment.attachmentBase64 || attachment.base64 || null,
+            appUrl: appUrl,
+            mailMetadata: enc.mailMetadata || null,
+            onProgress: setComposeStatus,
+          }).then(function () {
+            setEncryptButtonsDisabled(false);
+            var okLabel = document.getElementById("encrypt-success-label");
+            if (okLabel) {
+              okLabel.textContent = "✔ Encrypted and sent via Gmail";
+            }
+            setComposeStatus("Sent from " + from + " to " + pack.to + ".");
+          });
+        });
+      })
+      .catch(function (err) {
+        setEncryptButtonsDisabled(false);
+        setComposeStatus(err.message || String(err));
+      });
+  });
+}
+
+function hideEncryptSuccess() {
+  var box = document.getElementById("encrypt-success");
+  if (box) box.style.display = "none";
+}
+
+function showEncryptSuccess(res) {
+  var box = document.getElementById("encrypt-success");
+  var out = document.getElementById("encrypt-cipher-out");
+  var dl = document.getElementById("encrypt-download");
+  if (box) box.style.display = "flex";
+  if (out) out.value = res.messageCipherText || "";
+
+  var att = res.attachment || null;
+  var fileCipher = res.fileCipherText || (att && (att.content || att.base64)) || null;
+  var fileName =
+    (att && (att.name || att.filename || att.fileName)) ||
+    "encrypted.securefile";
+  var mime =
+    (att && (att.contentType || att.mimeType)) || "application/octet-stream";
+
+  if (dl) {
+    if (fileCipher) {
+      dl.style.display = "inline-block";
+      dl.href =
+        "data:" + mime + ";base64," + String(fileCipher).replace(/\s+/g, "");
+      dl.download = fileName;
+      dl.textContent = "⬇ Download " + fileName;
+    } else {
+      dl.style.display = "none";
+      dl.removeAttribute("href");
+    }
+  }
+}
+
+function bindDecryptUi() {
+  var btnDecrypt = document.getElementById("btn-decrypt");
+  var btnRetry = document.getElementById("btn-retry");
+  if (btnDecrypt && !btnDecrypt.dataset.bound) {
+    btnDecrypt.dataset.bound = "1";
+    btnDecrypt.addEventListener("click", onDecryptClick);
+  }
+  if (btnRetry && !btnRetry.dataset.bound) {
+    btnRetry.dataset.bound = "1";
+    btnRetry.addEventListener("click", function () {
+      showDecryptSection("decrypt-idle");
+    });
+  }
+}
+
+function onDecryptClick() {
+  requireAuthOrPrompt(function (ok, errMsg) {
+    if (!ok) {
+      showDecryptError(errMsg || "Sign in above first, then decrypt.");
+      return;
+    }
+    if (typeof decryptOnly !== "function") {
+      showDecryptError("decryptOnly is not loaded. Check common.js.");
+      return;
+    }
+
+    var recipientEl = document.getElementById("recipient-email");
+    var msgEl = document.getElementById("message-cipher");
+    var fileEl = document.getElementById("file-cipher");
+    var recipient =
+      (recipientEl && String(recipientEl.value || "").trim()) ||
+      _sessionEmail ||
+      "";
+    var msgCipher = msgEl ? String(msgEl.value || "").trim() : "";
+    var file = fileEl && fileEl.files && fileEl.files[0] ? fileEl.files[0] : null;
+
+    if (!recipient) {
+      showDecryptError("Enter your recipient email.");
+      return;
+    }
+    if (!msgCipher && !file) {
+      showDecryptError("Paste message ciphertext and/or choose an encrypted file.");
+      return;
+    }
+
+    showDecryptSection("decrypt-loading");
+
+    function run(fileCipher) {
+      decryptOnly({
+        apiBaseUrl: apiBase(),
+        email: recipient,
+        messageCipherText: msgCipher || undefined,
+        fileCipherText: fileCipher || undefined,
+      })
+        .then(function (res) {
+          if (!res.ok || !res.decrypted) {
+            showDecryptError(res.error || "Decryption failed.");
+            return;
+          }
+          showDecryptSuccess(res);
+        })
+        .catch(function (err) {
+          showDecryptError("Decryption error: " + (err.message || String(err)));
+        });
+    }
+
+    if (file) {
+      var reader = new FileReader();
+      reader.onload = function () {
+        var text = String(reader.result || "");
+        var comma = text.indexOf(",");
+        var b64 = comma >= 0 ? text.slice(comma + 1) : text;
+        run(b64);
+      };
+      reader.onerror = function () {
+        showDecryptError("Could not read the encrypted file.");
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+
+    run(null);
+  });
+}
+
+function showDecryptSection(sectionId) {
+  var sections = [
+    "decrypt-idle",
+    "decrypt-loading",
+    "decrypt-error",
+    "decrypt-success",
+  ];
+  for (var i = 0; i < sections.length; i++) {
+    var el = document.getElementById(sections[i]);
+    if (el) el.style.display = sections[i] === sectionId ? "block" : "none";
+  }
+}
+
+function showDecryptError(msg) {
+  var el = document.getElementById("error-msg");
+  if (el) el.textContent = msg;
+  showDecryptSection("decrypt-error");
+}
+
+function showDecryptSuccess(res) {
+  showDecryptSection("decrypt-success");
+  var msgSection = document.getElementById("message-section");
+  var msgBox = document.getElementById("decrypted-message");
+  var fileSection = document.getElementById("file-section");
+  var download = document.getElementById("download-link");
+  var okLine = document.querySelector("#decrypt-success .status-ok");
+
+  if (res.message && msgSection && msgBox) {
+    msgSection.style.display = "block";
+    msgBox.textContent = res.message;
+    if (okLine) okLine.textContent = "✔ Decrypted successfully";
+  } else if (msgSection) {
+    msgSection.style.display = "none";
+  }
+
+  var fileInfo =
+    typeof extractDecryptedFileBase64 === "function"
+      ? extractDecryptedFileBase64(res)
+      : null;
+  var b64 =
+    (fileInfo && fileInfo.base64) ||
+    res.decryptedBase64 ||
+    (res.file && (res.file.base64 || res.file.decryptedBase64)) ||
+    null;
+  var name =
+    (fileInfo && fileInfo.fileName) ||
+    res.filename ||
+    (res.file && res.file.filename) ||
+    "decrypted.bin";
+  var mime =
+    (fileInfo && fileInfo.mimeType) ||
+    res.mimeType ||
+    "application/octet-stream";
+
+  if (b64 && fileSection && download) {
+    fileSection.style.display = "block";
+    download.href =
+      "data:" + mime + ";base64," + String(b64).replace(/\s+/g, "");
+    download.download = name;
+    download.textContent = "⬇ Download " + name;
+  } else if (fileSection) {
+    fileSection.style.display = "none";
+  }
+
+  if (!res.message && !b64) {
+    showDecryptError("Decrypt succeeded but no message or file was returned.");
+  }
+}
+
+function resetToolPanels() {
+  hideEncryptSuccess();
+  setComposeStatus("");
+  showDecryptSection("decrypt-idle");
+  var cipherOut = document.getElementById("encrypt-cipher-out");
+  if (cipherOut) cipherOut.value = "";
+  var msgCipher = document.getElementById("message-cipher");
+  if (msgCipher) msgCipher.value = "";
+  var encMsg = document.getElementById("encrypt-message");
+  if (encMsg) encMsg.value = "";
+}
+
+</script>

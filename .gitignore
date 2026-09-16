@@ -1,0 +1,4 @@
+# Ignore local clasp credentials / project binding
+.clasp.json
+.clasprc.json
+node_modules/
