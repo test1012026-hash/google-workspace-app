@@ -169,128 +169,110 @@ function onCardLogout_(e) {
     .build();
 }
 
-function onCardEncrypt_(e) {
-  var form = (e && e.formInput) || {};
-  var to = String(form.encrypt_to || "").trim();
-  var subject = String(form.encrypt_subject || "").trim();
-  var message = String(form.encrypt_message || "");
-
-  if (!to) return notify_("Recipient email is required.");
-  if (!String(message || "").trim()) return notify_("Message is required.");
-
-  var gate = verifyLoginAndSubscription_();
-  if (!gate.ok) {
-    return CardService.newActionResponseBuilder()
-      .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
-      .setNotification(
-        CardService.newNotification().setText(
-          gate.error || "Login / subscription required."
-        )
-      )
-      .build();
-  }
-
-  var enc = apiEncrypt_(to, subject, message, gate.token);
-  if (!enc.ok) return notify_(enc.error || "Encrypt failed.");
-
-  var cipher = enc.messageCipherText || "";
-  var meta = enc.mailMetadata || null;
-  var metaToken = (meta && meta.token) || "";
-  var metaText = (meta && meta.textBlock) || "";
-  var section = CardService.newCardSection()
-    .addWidget(
-      CardService.newTextParagraph().setText(
-        "✔ Encrypted. Copy this ciphertext into your Gmail message, then Send."
-      )
-    )
-    .addWidget(
-      CardService.newTextInput()
-        .setFieldName("cipher_out")
-        .setTitle("Ciphertext")
-        .setMultiline(true)
-        .setValue(cipher)
-    );
-
-  if (metaToken || metaText) {
-    section.addWidget(
-      CardService.newTextParagraph().setText(
-        "Also paste the Metadata section below into the same mail (required for admin lookup)."
-      )
-    );
-    section.addWidget(
-      CardService.newTextInput()
-        .setFieldName("meta_out")
-        .setTitle("Metadata")
-        .setMultiline(true)
-        .setValue(metaText || metaToken)
-    );
-  }
-
-  section.addWidget(
-    CardService.newTextButton()
-      .setText("Back")
-      .setOnClickAction(
-        CardService.newAction().setFunctionName("onCardBack_")
-      )
-  );
-
-  var card = CardService.newCardBuilder()
-    .setHeader(cardHeader_("Encrypted", "Copy into Gmail"))
-    .addSection(section)
-    .build();
-
-  return CardService.newActionResponseBuilder()
-    .setNavigation(CardService.newNavigation().pushCard(card))
-    .build();
-}
-
 function onCardDecrypt_(e) {
-  var form = (e && e.formInput) || {};
-  var cipher = String(form.decrypt_cipher || "").trim();
-  if (!cipher) {
-    try {
-      cipher = extractCipherFromMessage_(e) || "";
-    } catch (err) {}
-  }
-  if (!cipher) return notify_("Paste ciphertext first.");
+  try {
+    var form = (e && e.formInput) || {};
+    var cipher = String(form.decrypt_cipher || "").trim();
+    if (!cipher) {
+      try {
+        cipher = extractCipherFromMessage_(e) || "";
+      } catch (err) {}
+    }
+    if (!cipher) {
+      return CardService.newActionResponseBuilder()
+        .setNavigation(
+          CardService.newNavigation().updateCard(
+            buildDecryptErrorCard_("Paste ciphertext first, then decrypt.")
+          )
+        )
+        .setNotification(
+          CardService.newNotification().setText("Paste ciphertext first.")
+        )
+        .build();
+    }
 
-  var valid = getValidWorkspaceAuth_();
-  if (!valid) {
+    var valid = getValidWorkspaceAuth_();
+    if (!valid) {
+      return CardService.newActionResponseBuilder()
+        .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
+        .setNotification(
+          CardService.newNotification().setText("Sign in first, then decrypt.")
+        )
+        .build();
+    }
+
+    var email = valid.auth.email || valid.session.email || "";
+    if (!email) {
+      return CardService.newActionResponseBuilder()
+        .setNavigation(
+          CardService.newNavigation().updateCard(
+            buildDecryptErrorCard_(
+              "Signed-in email missing. Sign out and sign in again, then decrypt."
+            )
+          )
+        )
+        .setNotification(
+          CardService.newNotification().setText("Signed-in email missing.")
+        )
+        .build();
+    }
+
+    var dec = apiDecrypt_({
+      email: email,
+      messageCipherText: cipher,
+      token: valid.session.token,
+    });
+    if (!dec.ok) {
+      var errText = formatDecryptError_(dec, "Decrypt failed.");
+      return CardService.newActionResponseBuilder()
+        .setNavigation(
+          CardService.newNavigation().updateCard(buildDecryptErrorCard_(errText))
+        )
+        .setNotification(CardService.newNotification().setText(errText))
+        .build();
+    }
+
+    if (!String(dec.message || "").trim()) {
+      var emptyErr =
+        "Decrypt succeeded but no message text was returned. Check the ciphertext and try again.";
+      return CardService.newActionResponseBuilder()
+        .setNavigation(
+          CardService.newNavigation().updateCard(buildDecryptErrorCard_(emptyErr))
+        )
+        .setNotification(CardService.newNotification().setText(emptyErr))
+        .build();
+    }
+
+    var section = CardService.newCardSection().addWidget(
+      CardService.newTextParagraph().setText(dec.message)
+    );
+    section.addWidget(
+      CardService.newTextButton()
+        .setText("Back")
+        .setOnClickAction(CardService.newAction().setFunctionName("onCardBack_"))
+    );
+
+    var card = CardService.newCardBuilder()
+      .setHeader(cardHeader_("Decrypted", "SecureDocShare"))
+      .addSection(section)
+      .build();
+
     return CardService.newActionResponseBuilder()
-      .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
+      .setNavigation(CardService.newNavigation().pushCard(card))
       .setNotification(
-        CardService.newNotification().setText("Sign in first, then decrypt.")
+        CardService.newNotification().setText("Message decrypted.")
       )
       .build();
+  } catch (err) {
+    var crash =
+      "Decrypt error: " + String(err && err.message ? err.message : err);
+    return CardService.newActionResponseBuilder()
+      .setNavigation(
+        CardService.newNavigation().updateCard(buildDecryptErrorCard_(crash))
+      )
+      .setNotification(CardService.newNotification().setText(crash))
+      .build();
   }
-
-  var email = valid.auth.email || valid.session.email || "";
-  var dec = apiDecrypt_({
-    email: email,
-    messageCipherText: cipher,
-    token: valid.session.token,
-  });
-  if (!dec.ok) return notify_(dec.error || "Decrypt failed.");
-
-  var section = CardService.newCardSection().addWidget(
-    CardService.newTextParagraph().setText(
-      dec.message || "(No message text returned)"
-    )
-  );
-  section.addWidget(
-    CardService.newTextButton()
-      .setText("Back")
-      .setOnClickAction(CardService.newAction().setFunctionName("onCardBack_"))
-  );
-
-  var card = CardService.newCardBuilder()
-    .setHeader(cardHeader_("Decrypted", "SecureDocShare"))
-    .addSection(section)
-    .build();
-
-  return CardService.newActionResponseBuilder()
-    .setNavigation(CardService.newNavigation().pushCard(card))
-    .build();
 }
 
 function onCardBack_(e) {

@@ -1436,13 +1436,19 @@ function onDecryptClick() {
       })
         .then(function (res) {
           if (!res.ok || !res.decrypted) {
-            showDecryptError(res.error || "Decryption failed.");
+            showDecryptError(
+              res.error ||
+                (res.code ? "Decryption failed [" + res.code + "]" : "") ||
+                "Decryption failed."
+            );
             return;
           }
           showDecryptSuccess(res);
         })
         .catch(function (err) {
-          showDecryptError("Decryption error: " + (err.message || String(err)));
+          showDecryptError(
+            "Decryption error: " + (err && err.message ? err.message : String(err))
+          );
         });
     }
 
@@ -1479,8 +1485,9 @@ function showDecryptSection(sectionId) {
 }
 
 function showDecryptError(msg) {
+  var text = String(msg || "Decryption failed.").trim() || "Decryption failed.";
   var el = document.getElementById("error-msg");
-  if (el) el.textContent = msg;
+  if (el) el.textContent = text;
   showDecryptSection("decrypt-error");
 }
 

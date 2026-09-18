@@ -65,7 +65,6 @@ function buildMainCard_(e) {
     cardHeader_("SecureDocShare", "Ready")
   );
   card.addSection(buildSignedInSection_(valid.session, valid.auth));
-  card.addSection(buildEncryptSection_());
   card.addSection(buildDecryptSection_(e));
   card.addSection(buildLinksSection_());
   return card.build();
@@ -249,87 +248,6 @@ function buildSignedInSection_(session, prefetchedAuth) {
     );
 }
 
-function buildEncryptSection_() {
-  var web = buildComposeMailboxUrl_();
-  var section = CardService.newCardSection()
-    .setHeader("Encrypt")
-    .setCollapsible(true)
-    .setNumUncollapsibleWidgets(1)
-    .addWidget(
-      infoRow_(
-        "Encrypt message",
-        "Enter recipient, subject, and message. To attach a file, use Attach file (Gmail cards cannot pick files directly)."
-      )
-    )
-    .addWidget(
-      CardService.newTextInput()
-        .setFieldName("encrypt_to")
-        .setTitle("Recipient email")
-        .setHint("recipient@email.com")
-    )
-    .addWidget(
-      CardService.newTextInput().setFieldName("encrypt_subject").setTitle("Subject")
-    )
-    .addWidget(
-      CardService.newTextInput()
-        .setFieldName("encrypt_message")
-        .setTitle("Message")
-        .setMultiline(true)
-    );
-
-  // File pick is only possible in HtmlService compose (not Card widgets).
-  if (web) {
-    section.addWidget(
-      CardService.newButtonSet().addButton(
-        CardService.newTextButton()
-          .setText("Attach file…")
-          .setTextButtonStyle(CardService.TextButtonStyle.OUTLINED)
-          .setOpenLink(openComposeInAppLink_(web))
-      )
-    );
-  }
-
-  section.addWidget(
-    CardService.newButtonSet().addButton(
-      primaryBtn_("Encrypt message", "onCardEncrypt_")
-    )
-  );
-
-  return section;
-}
-
-/** Open HtmlService compose as in-Gmail overlay (contacts chips UI). */
-function openComposeInAppLink_(url) {
-  return CardService.newOpenLink()
-    .setUrl(String(url))
-    .setOpenAs(CardService.OpenAs.OVERLAY)
-    .setOnClose(CardService.OnClose.RELOAD_ADD_ON);
-}
-
-/** Compose modal URL with one-time session ticket. */
-function buildComposeMailboxUrl_() {
-  var web = getWebAppUrl_();
-  if (!web || String(web).indexOf("http") !== 0) return "";
-  var base = String(web).split("?")[0] + "?view=compose&embed=1";
-  var session = getWorkspaceSession_();
-  if (!session || !session.token) return base;
-  try {
-    var ticket = Utilities.getUuid();
-    CacheService.getScriptCache().put(
-      "sds_compose_" + ticket,
-      JSON.stringify({
-        token: String(session.token),
-        email: String(session.email || ""),
-        expiresAt: session.expiresAt || null,
-      }),
-      300
-    );
-    return base + "&compose_ticket=" + encodeURIComponent(ticket);
-  } catch (eTicket) {
-    return base;
-  }
-}
-
 function buildDecryptSection_(e) {
   var detected = "";
   var scan = { cipher: "", attachments: [] };
@@ -416,116 +334,167 @@ function addHomePdfDownloadWidgets_(section, e, scan) {
   );
 }
 
-/** Decrypt secure attachments on demand and show download links. */
 function onHomeDownloadPdf_(e) {
-  var valid = getValidWorkspaceAuth_();
-  if (!valid) {
-    return CardService.newActionResponseBuilder()
-      .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
-      .setNotification(
-        CardService.newNotification().setText("Sign in first to download.")
+  try {
+    var valid = getValidWorkspaceAuth_();
+    if (!valid) {
+      return CardService.newActionResponseBuilder()
+        .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
+        .setNotification(
+          CardService.newNotification().setText("Sign in first to download.")
+        )
+        .build();
+    }
+    var session = valid.session;
+    var auth = valid.auth;
+    var scan = scanMessageForSecureDoc_(e);
+    if (!scan.attachments || !scan.attachments.length) {
+      return CardService.newActionResponseBuilder()
+        .setNavigation(
+          CardService.newNavigation().updateCard(
+            buildDecryptErrorCard_("No secure attachment found on this mail.")
+          )
+        )
+        .setNotification(
+          CardService.newNotification().setText("No secure attachment found.")
+        )
+        .build();
+    }
+
+    var email = auth.email || session.email || "";
+    if (!email) {
+      return CardService.newActionResponseBuilder()
+        .setNavigation(
+          CardService.newNavigation().updateCard(
+            buildDecryptErrorCard_(
+              "Signed-in email missing. Sign out and sign in again."
+            )
+          )
+        )
+        .setNotification(
+          CardService.newNotification().setText("Signed-in email missing.")
+        )
+        .build();
+    }
+
+    var section = CardService.newCardSection().setHeader("Downloads");
+    var readyCount = 0;
+    var failCount = 0;
+    var i;
+    for (i = 0; i < scan.attachments.length; i++) {
+      var att = scan.attachments[i];
+      var fileDec = apiDecrypt_({
+        email: email,
+        fileCipherText: att.base64,
+        token: session.token,
+      });
+      if (!fileDec.ok) {
+        failCount += 1;
+        section.addWidget(
+          statusRow_(
+            (att.name || "file") +
+              ": " +
+              formatDecryptError_(fileDec, "decrypt failed"),
+            false
+          )
+        );
+        continue;
+      }
+      var fileInfo = fileDec.file || null;
+      var dataB64 =
+        (fileInfo &&
+          (fileInfo.dataBase64 || fileInfo.base64 || fileInfo.data)) ||
+        null;
+      if (!dataB64) {
+        failCount += 1;
+        section.addWidget(
+          statusRow_(
+            (att.name || "file") +
+              ": decrypt returned no file data. Try Refresh or open the mail again.",
+            false
+          )
+        );
+        continue;
+      }
+
+      var meta = normalizeDecryptedFileMeta_(
+        att.name,
+        fileInfo,
+        fileDec.filename
+      );
+      var ready = prepareDecryptedDownload_(meta.name, meta.mime, dataB64);
+      if (ready.ok && ready.downloadUrl) {
+        readyCount += 1;
+        section.addWidget(
+          CardService.newDecoratedText()
+            .setTopLabel("Ready")
+            .setText(meta.name)
+            .setBottomLabel("From " + (att.name || "secure file"))
+            .setWrapText(true)
+        );
+        section.addWidget(
+          CardService.newButtonSet().addButton(
+            CardService.newTextButton()
+              .setText("⬇ Download")
+              .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+              .setOpenLink(
+                CardService.newOpenLink()
+                  .setUrl(ready.downloadUrl)
+                  .setOpenAs(CardService.OpenAs.FULL_SIZE)
+                  .setOnClose(CardService.OnClose.NOTHING)
+              )
+          )
+        );
+      } else {
+        failCount += 1;
+        section.addWidget(
+          statusRow_(
+            meta.name + ": " + (ready.error || "download not ready"),
+            false
+          )
+        );
+      }
+    }
+
+    var card = CardService.newCardBuilder()
+      .setHeader(
+        cardHeader_(
+          "SecureDocShare",
+          readyCount ? "Downloads" : "Decrypt failed"
+        )
+      )
+      .addSection(section)
+      .addSection(
+        CardService.newCardSection().addWidget(
+          CardService.newButtonSet().addButton(
+            secondaryBtn_("Back", "onCardBack_")
+          )
+        )
       )
       .build();
-  }
-  var session = valid.session;
-  var auth = valid.auth;
-  var scan = scanMessageForSecureDoc_(e);
-  if (!scan.attachments || !scan.attachments.length) {
-    return notify_("No secure attachment found on this mail.");
-  }
 
-  var email = auth.email || session.email || "";
-  var section = CardService.newCardSection().setHeader("Downloads");
-  var readyCount = 0;
-  var i;
-  for (i = 0; i < scan.attachments.length; i++) {
-    var att = scan.attachments[i];
-    var fileDec = apiDecrypt_({
-      email: email,
-      fileCipherText: att.base64,
-      token: session.token,
-    });
-    if (!fileDec.ok) {
-      section.addWidget(
-        statusRow_(
-          (att.name || "file") + ": " + (fileDec.error || "decrypt failed"),
-          false
-        )
-      );
-      continue;
-    }
-    var fileInfo = fileDec.file || null;
-    var dataB64 =
-      (fileInfo &&
-        (fileInfo.dataBase64 || fileInfo.base64 || fileInfo.data)) ||
-      null;
-    if (!dataB64) continue;
+    var note = readyCount
+      ? readyCount + " file(s) ready to download."
+      : failCount
+        ? "Could not decrypt attachment(s). See error details on the card."
+        : "Could not prepare downloads.";
 
-    var meta = normalizeDecryptedFileMeta_(
-      att.name,
-      fileInfo,
-      fileDec.filename
-    );
-    var ready = prepareDecryptedDownload_(meta.name, meta.mime, dataB64);
-    if (ready.ok && ready.downloadUrl) {
-      readyCount += 1;
-      section.addWidget(
-        CardService.newDecoratedText()
-          .setTopLabel("Ready")
-          .setText(meta.name)
-          .setBottomLabel("From " + (att.name || "secure file"))
-          .setWrapText(true)
-      );
-      section.addWidget(
-        CardService.newButtonSet().addButton(
-          CardService.newTextButton()
-            .setText("⬇ Download")
-            .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-            .setOpenLink(
-              CardService.newOpenLink()
-                .setUrl(ready.downloadUrl)
-                .setOpenAs(CardService.OpenAs.FULL_SIZE)
-                .setOnClose(CardService.OnClose.NOTHING)
-            )
-        )
-      );
-    } else {
-      section.addWidget(
-        statusRow_(
-          meta.name + ": " + (ready.error || "download not ready"),
-          false
-        )
-      );
-    }
-  }
-
-  var card = CardService.newCardBuilder()
-    .setHeader(cardHeader_("SecureDocShare", "Downloads"))
-    .addSection(section)
-    .addSection(
-      CardService.newCardSection().addWidget(
-        CardService.newButtonSet().addButton(
-          secondaryBtn_("Back", "onCardBack_")
-        )
+    return CardService.newActionResponseBuilder()
+      .setNavigation(CardService.newNavigation().updateCard(card))
+      .setNotification(CardService.newNotification().setText(note))
+      .build();
+  } catch (err) {
+    var crash =
+      "Decrypt error: " + String(err && err.message ? err.message : err);
+    return CardService.newActionResponseBuilder()
+      .setNavigation(
+        CardService.newNavigation().updateCard(buildDecryptErrorCard_(crash))
       )
-    )
-    .build();
-
-  return CardService.newActionResponseBuilder()
-    .setNavigation(CardService.newNavigation().updateCard(card))
-    .setNotification(
-      CardService.newNotification().setText(
-        readyCount
-          ? readyCount + " file(s) ready to download."
-          : "Could not prepare downloads."
-      )
-    )
-    .build();
+      .setNotification(CardService.newNotification().setText(crash))
+      .build();
+  }
 }
 
-/**
- * Auto-decrypt mode for an open Gmail message (message body + attachments).
- */
 function buildAutoDecryptCard_(e, session, scan) {
   var auth = apiGetSubscription_(session.token);
   if (!auth.ok) {
@@ -551,6 +520,28 @@ function buildAutoDecryptCard_(e, session, scan) {
   var filesSection = CardService.newCardSection().setHeader("Files");
   var hasMessageUi = false;
   var hasFileUi = false;
+  var anyFailed = false;
+
+  if (!email) {
+    statusSection.addWidget(
+      statusRow_(
+        "Signed-in email missing. Sign out and sign in again to decrypt.",
+        false
+      )
+    );
+    return CardService.newCardBuilder()
+      .setHeader(cardHeader_("SecureDocShare", "Decrypt failed"))
+      .addSection(statusSection)
+      .addSection(buildSignedInSection_(session, auth))
+      .addSection(
+        CardService.newCardSection().addWidget(
+          CardService.newButtonSet()
+            .addButton(secondaryBtn_("Refresh", "onRefreshAutoDecrypt_"))
+            .addButton(secondaryBtn_("Home", "onCardBack_"))
+        )
+      )
+      .build();
+  }
 
   var foundBits = [];
   if (scan.cipher) foundBits.push("encrypted message");
@@ -562,25 +553,44 @@ function buildAutoDecryptCard_(e, session, scan) {
   );
 
   if (scan.cipher) {
-    var msgDec = apiDecrypt_({
-      email: email,
-      messageCipherText: scan.cipher,
-      token: session.token,
-    });
-    if (msgDec.ok && msgDec.message) {
+    try {
+      var msgDec = apiDecrypt_({
+        email: email,
+        messageCipherText: scan.cipher,
+        token: session.token,
+      });
+      if (msgDec.ok && msgDec.message) {
+        hasMessageUi = true;
+        messageSection.addWidget(statusRow_("Message decrypted", true));
+        addDecryptedMessagePreview_(
+          messageSection,
+          "auto_plain_message",
+          "Decrypted message",
+          String(msgDec.message)
+        );
+      } else {
+        hasMessageUi = true;
+        anyFailed = true;
+        messageSection.addWidget(
+          statusRow_(
+            "Message decrypt failed: " +
+              formatDecryptError_(
+                msgDec,
+                msgDec && msgDec.ok
+                  ? "no message text returned"
+                  : "unknown error"
+              ),
+            false
+          )
+        );
+      }
+    } catch (msgErr) {
       hasMessageUi = true;
-      messageSection.addWidget(statusRow_("Message decrypted", true));
-      addDecryptedMessagePreview_(
-        messageSection,
-        "auto_plain_message",
-        "Decrypted message",
-        String(msgDec.message)
-      );
-    } else {
-      hasMessageUi = true;
+      anyFailed = true;
       messageSection.addWidget(
         statusRow_(
-          "Message decrypt failed: " + (msgDec.error || "unknown error"),
+          "Message decrypt error: " +
+            String(msgErr && msgErr.message ? msgErr.message : msgErr),
           false
         )
       );
@@ -590,84 +600,125 @@ function buildAutoDecryptCard_(e, session, scan) {
   var i;
   for (i = 0; i < (scan.attachments || []).length; i++) {
     var att = scan.attachments[i];
-    var fileDec = apiDecrypt_({
-      email: email,
-      fileCipherText: att.base64,
-      token: session.token,
-    });
-    if (!fileDec.ok) {
-      hasFileUi = true;
-      filesSection.addWidget(
-        statusRow_(
-          (att.name || "attachment") +
-            " — " +
-            (fileDec.error || "decrypt failed"),
-          false
-        )
-      );
-      continue;
-    }
-
-    if (fileDec.message) {
-      hasFileUi = true;
-      filesSection.addWidget(
-        statusRow_("Attachment included message text", true)
-      );
-      addDecryptedMessagePreview_(
-        filesSection,
-        "auto_att_msg_" + i,
-        "From " + (att.name || "attachment"),
-        String(fileDec.message)
-      );
-    }
-
-    var fileInfo = fileDec.file || null;
-    var dataB64 =
-      (fileInfo &&
-        (fileInfo.dataBase64 || fileInfo.base64 || fileInfo.data)) ||
-      null;
-    if (dataB64) {
-      hasFileUi = true;
-      var meta = normalizeDecryptedFileMeta_(
-        att.name,
-        fileInfo,
-        fileDec.filename
-      );
-      var ready = prepareDecryptedDownload_(meta.name, meta.mime, dataB64);
-      if (ready.ok && ready.downloadUrl) {
-        filesSection.addWidget(
-          CardService.newDecoratedText()
-            .setTopLabel("File ready")
-            .setText(meta.name)
-            .setBottomLabel("From " + (att.name || "secure file"))
-            .setWrapText(true)
-        );
-        filesSection.addWidget(
-          CardService.newButtonSet().addButton(
-            CardService.newTextButton()
-              .setText("⬇ Download")
-              .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-              .setOpenLink(
-                CardService.newOpenLink()
-                  .setUrl(ready.downloadUrl)
-                  .setOpenAs(CardService.OpenAs.FULL_SIZE)
-                  .setOnClose(CardService.OnClose.NOTHING)
-              )
-          )
-        );
-      } else {
+    try {
+      var fileDec = apiDecrypt_({
+        email: email,
+        fileCipherText: att.base64,
+        token: session.token,
+      });
+      if (!fileDec.ok) {
+        hasFileUi = true;
+        anyFailed = true;
         filesSection.addWidget(
           statusRow_(
-            meta.name + ": " + (ready.error || "download not ready"),
+            (att.name || "attachment") +
+              " — " +
+              formatDecryptError_(fileDec, "decrypt failed"),
+            false
+          )
+        );
+        continue;
+      }
+
+      if (fileDec.message) {
+        hasFileUi = true;
+        filesSection.addWidget(
+          statusRow_("Attachment included message text", true)
+        );
+        addDecryptedMessagePreview_(
+          filesSection,
+          "auto_att_msg_" + i,
+          "From " + (att.name || "attachment"),
+          String(fileDec.message)
+        );
+      }
+
+      var fileInfo = fileDec.file || null;
+      var dataB64 =
+        (fileInfo &&
+          (fileInfo.dataBase64 || fileInfo.base64 || fileInfo.data)) ||
+        null;
+      if (dataB64) {
+        hasFileUi = true;
+        var meta = normalizeDecryptedFileMeta_(
+          att.name,
+          fileInfo,
+          fileDec.filename
+        );
+        var ready = prepareDecryptedDownload_(meta.name, meta.mime, dataB64);
+        if (ready.ok && ready.downloadUrl) {
+          filesSection.addWidget(
+            CardService.newDecoratedText()
+              .setTopLabel("File ready")
+              .setText(meta.name)
+              .setBottomLabel("From " + (att.name || "secure file"))
+              .setWrapText(true)
+          );
+          filesSection.addWidget(
+            CardService.newButtonSet().addButton(
+              CardService.newTextButton()
+                .setText("⬇ Download")
+                .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+                .setOpenLink(
+                  CardService.newOpenLink()
+                    .setUrl(ready.downloadUrl)
+                    .setOpenAs(CardService.OpenAs.FULL_SIZE)
+                    .setOnClose(CardService.OnClose.NOTHING)
+                )
+            )
+          );
+        } else {
+          anyFailed = true;
+          filesSection.addWidget(
+            statusRow_(
+              meta.name + ": " + (ready.error || "download not ready"),
+              false
+            )
+          );
+        }
+      } else if (!fileDec.message) {
+        hasFileUi = true;
+        anyFailed = true;
+        filesSection.addWidget(
+          statusRow_(
+            (att.name || "attachment") +
+              " — decrypt returned no file data.",
             false
           )
         );
       }
+    } catch (fileErr) {
+      hasFileUi = true;
+      anyFailed = true;
+      filesSection.addWidget(
+        statusRow_(
+          (att.name || "attachment") +
+            " — " +
+            String(fileErr && fileErr.message ? fileErr.message : fileErr),
+          false
+        )
+      );
     }
   }
 
+  if (anyFailed) {
+    statusSection.addWidget(
+      statusRow_(
+        "One or more items could not be decrypted. See details below.",
+        false
+      )
+    );
+  }
+
   var builder = CardService.newCardBuilder().setHeader(
-    cardHeader_("SecureDocShare", "Decrypted")
+    cardHeader_(
+      "SecureDocShare",
+      anyFailed && !hasMessageUi && !hasFileUi
+        ? "Decrypt failed"
+        : anyFailed
+          ? "Decrypted with errors"
+          : "Decrypted"
+    )
   );
   builder.addSection(statusSection);
   if (hasMessageUi) builder.addSection(messageSection);

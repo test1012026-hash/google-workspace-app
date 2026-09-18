@@ -221,7 +221,6 @@ function apiGmailSendToken_(token) {
   }
 }
 
-/** Decrypt message and/or file package via /public/decrypt */
 function apiDecrypt_(options) {
   options = options || {};
   try {
@@ -249,9 +248,22 @@ function apiDecrypt_(options) {
     var data = {};
     try {
       data = JSON.parse(res.getContentText() || "{}");
-    } catch (e) {}
+    } catch (e) {
+      return {
+        ok: false,
+        code: "BAD_RESPONSE",
+        error: "Decrypt failed: invalid server response (" + code + ").",
+      };
+    }
     if (code < 200 || code >= 300 || data.ok === false) {
-      return { ok: false, error: data.error || "Decrypt failed (" + code + ")" };
+      return {
+        ok: false,
+        code: data.code || "",
+        error:
+          data.error ||
+          data.message ||
+          "Decrypt failed (" + code + ").",
+      };
     }
     return {
       ok: true,
@@ -261,7 +273,37 @@ function apiDecrypt_(options) {
       decrypted: true,
     };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    return {
+      ok: false,
+      code: "DECRYPT_EXCEPTION",
+      error: "Decrypt error: " + String(err && err.message ? err.message : err),
+    };
   }
+}
+
+function formatDecryptError_(result, fallback) {
+  var base = fallback || "Decrypt failed.";
+  if (!result) return base;
+  var msg = String(result.error || "").trim();
+  if (!msg) msg = base;
+  if (result.code && String(msg).indexOf(String(result.code)) < 0) {
+    msg = msg + " [" + result.code + "]";
+  }
+  return msg;
+}
+
+function buildDecryptErrorCard_(message) {
+  return CardService.newCardBuilder()
+    .setHeader(cardHeader_("SecureDocShare", "Decrypt failed"))
+    .addSection(
+      CardService.newCardSection()
+        .addWidget(statusRow_(String(message || "Decrypt failed."), false))
+        .addWidget(
+          CardService.newButtonSet().addButton(
+            secondaryBtn_("Back", "onCardBack_")
+          )
+        )
+    )
+    .build();
 }
 
