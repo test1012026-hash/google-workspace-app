@@ -1,0 +1,11 @@
+{
+  "name": "securedoc-google-workspace-app",
+  "version": "1.1.0",
+  "private": true,
+  "description": "SecureDocShare Google Workspace / Gmail add-on",
+  "scripts": {
+    "build": "node scripts/build-code.cjs && node scripts/build-html.cjs",
+    "build:code": "node scripts/build-code.cjs",
+    "build:html": "node scripts/build-html.cjs"
+  }
+}

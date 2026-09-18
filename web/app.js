@@ -1,9 +1,8 @@
 /**
- * SecureDocShare Workspace UI — same login/logout/signup/SSO/encrypt/decrypt
- * flow as outlook-tool taskpane (without Office.js).
+ * SecureDocShare Workspace UI — login, encrypt, decrypt for Gmail HtmlService.
  */
 
-function apiBase() {
+function getApiBaseUrl() {
   if (typeof SecureDocConfig !== "undefined" && SecureDocConfig.getApiBaseUrl) {
     return SecureDocConfig.getApiBaseUrl();
   }
@@ -13,6 +12,17 @@ function apiBase() {
   );
 }
 
+/** @deprecated use getApiBaseUrl */
+function apiBase() {
+  return getApiBaseUrl();
+}
+
+function storedSessionToken() {
+  if (typeof getStoredSession !== "function") return "";
+  var session = getStoredSession();
+  return session && session.token ? String(session.token) : "";
+}
+
 var _authReady = false;
 var _authMode = "login";
 var _signupOtpSent = false;
@@ -20,15 +30,344 @@ var _uiMode = "encrypt";
 var _sessionEmail = "";
 var _subscriptionActive = false;
 var _sessionToken = "";
+var _recipientInput = null;
 
 document.addEventListener("DOMContentLoaded", function () {
+  if (window.__COMPOSE_MODAL__) {
+    bootComposeModal_();
+    return;
+  }
   initAuthUi();
   setAuthMode("login");
   bindModeTabs();
+  initRecipientChips_();
   bindEncryptUi();
   bindDecryptUi();
+  applyViewQuery_();
+  if (handleOAuthTicketQuery_()) return;
+  handleSsoLaunchQuery_();
   refreshAuthState(function () {});
 });
+
+/**
+ * Card compose overlay: recipient chips + subject + message using add-on session.
+ */
+function bootComposeModal_() {
+  try {
+    document.documentElement.classList.add("is-embed", "is-compose-modal");
+    document.body.classList.add("is-embed", "is-compose-modal");
+  } catch (e0) {}
+
+  _uiMode = "encrypt";
+  initRecipientChips_();
+  bindEncryptUi();
+
+  var gate = document.getElementById("compose-gate");
+  var root = document.getElementById("compose-modal-root");
+  var gateMsg = document.getElementById("compose-gate-msg");
+  var userLabel = document.getElementById("compose-user-label");
+
+  function showGate(msg) {
+    if (gateMsg && msg) gateMsg.textContent = msg;
+    if (gate) gate.style.display = "block";
+    if (root) root.style.display = "none";
+  }
+
+  function showCompose(email) {
+    if (gate) gate.style.display = "none";
+    if (root) root.style.display = "flex";
+    if (userLabel) {
+      userLabel.textContent = email
+        ? "Signed in as " + email
+        : "SecureDoc compose";
+    }
+  }
+
+  function applySession(session) {
+    if (!session || !session.token) {
+      showGate(
+        "Sign in from the SecureDocShare side panel first, then open Compose again."
+      );
+      return;
+    }
+    try {
+      if (typeof saveSession === "function") {
+        saveSession({
+          token: session.token,
+          email: session.email || "",
+          expiresAt: session.expiresAt || null,
+        });
+      }
+    } catch (e1) {}
+    _sessionToken = String(session.token);
+    _sessionEmail = String(session.email || "");
+    _authReady = true;
+
+    requireAuthAndSubscription(function (ok, errMsg) {
+      if (!ok) {
+        showGate(
+          errMsg ||
+            "Sign in with an active subscription from the SecureDocShare side panel."
+        );
+        return;
+      }
+      showCompose(_sessionEmail);
+    });
+  }
+
+  var injected = null;
+  try {
+    injected = window.__WORKSPACE_SESSION__ || null;
+  } catch (e2) {
+    injected = null;
+  }
+
+  if (injected && injected.token) {
+    applySession(injected);
+    return;
+  }
+
+  hydrateSessionFromAppsScript_(function (session) {
+    if (session && session.token) {
+      applySession(session);
+      return;
+    }
+    var local =
+      typeof getStoredSession === "function" ? getStoredSession() : null;
+    if (local && local.token) {
+      applySession(local);
+      return;
+    }
+    showGate(
+      "Sign in from the SecureDocShare side panel first, then open Compose again."
+    );
+  });
+}
+
+/** Card "Compose & send" → ?view=compose&embed=1 (Gmail overlay). */
+function applyViewQuery_() {
+  try {
+    var params = new URLSearchParams(location.search || "");
+    var view = params.get("view");
+    var embed = params.get("embed") === "1";
+    if (view === "compose" || view === "encrypt") {
+      _uiMode = "encrypt";
+    } else if (view === "decrypt") {
+      _uiMode = "decrypt";
+    }
+    if (embed) {
+      try {
+        document.documentElement.classList.add("is-embed");
+        document.body.classList.add("is-embed");
+      } catch (e0) {}
+    }
+  } catch (e) {}
+}
+
+function initComposeWidgets_() {
+  initRecipientChips_();
+}
+
+/** Recipient chips + Google Contacts dropdown (People API via Apps Script). */
+function initRecipientChips_() {
+  var recipientRoot = document.getElementById("recipient-input-root");
+  if (!recipientRoot || typeof createRecipientInput !== "function") {
+    var fallback = document.getElementById("encrypt-to");
+    if (fallback) fallback.style.display = "";
+    return;
+  }
+  if (_recipientInput) return;
+  _recipientInput = createRecipientInput(recipientRoot, {
+    placeholder: "Type name or email…",
+    onChange: function (emails) {
+      var hidden = document.getElementById("encrypt-to");
+      if (hidden) hidden.value = (emails || []).join(", ");
+    },
+  });
+}
+
+/**
+ * Legacy: OAuth returned to Apps Script ?oauth_ticket=…
+ * Complete login here, notify opener, close popup (or refresh this panel).
+ * @returns {boolean} true if a ticket was handled (skip normal boot).
+ */
+function handleOAuthTicketQuery_() {
+  var params;
+  try {
+    params = new URLSearchParams(location.search || "");
+  } catch (e) {
+    return false;
+  }
+  var ticket = params.get("oauth_ticket");
+  var oauthErr = params.get("oauth_error");
+  if (!ticket && !oauthErr) return false;
+
+  var gate = document.getElementById("auth-gate-hint");
+  if (gate) {
+    gate.style.display = "block";
+    gate.textContent = oauthErr ? oauthErr : "Completing Google sign-in…";
+  }
+
+  function stripTicketFromUrl_() {
+    try {
+      var u = new URL(location.href);
+      u.searchParams.delete("oauth_ticket");
+      u.searchParams.delete("oauth_error");
+      history.replaceState({}, "", u.pathname + u.search + u.hash);
+    } catch (e2) {}
+  }
+
+  function notifyOpenerAndClose_(payload) {
+    try {
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage(
+          Object.assign({ type: "securedoc-oauth" }, payload),
+          "*"
+        );
+      }
+    } catch (e3) {}
+    setTimeout(function () {
+      try {
+        window.close();
+      } catch (e4) {}
+    }, 400);
+  }
+
+  if (oauthErr) {
+    setLoginError(oauthErr);
+    notifyOpenerAndClose_({ ok: false, error: oauthErr });
+    stripTicketFromUrl_();
+    return true;
+  }
+
+  if (typeof completeOAuthTicket !== "function") {
+    setLoginError("OAuth helper not loaded.");
+    return true;
+  }
+
+  completeOAuthTicket({ ticket: ticket, apiBaseUrl: apiBase() }).then(
+    function (res) {
+      setSsoBusy(false);
+      if (!res || !res.ok) {
+        var err =
+          (res && res.data && (res.data.error || res.data.message)) ||
+          "Google sign-in failed";
+        setLoginError(err);
+        notifyOpenerAndClose_({ ok: false, error: err });
+        stripTicketFromUrl_();
+        return;
+      }
+      var data = res.data || {};
+      var token = data.token || data.accessToken || "";
+      var email = data.email || "";
+      if (typeof storeAuthResponse === "function" && token) {
+        storeAuthResponse(
+          {
+            token: token,
+            expiresAt: data.expiresAt,
+            email: email,
+            refreshToken: data.refreshToken,
+          },
+          email
+        );
+      }
+      try {
+        if (
+          typeof google !== "undefined" &&
+          google.script &&
+          google.script.run &&
+          typeof google.script.run.saveWorkspaceSession === "function"
+        ) {
+          google.script.run.saveWorkspaceSession({
+            token: token,
+            email: email,
+            expiresAt: data.expiresAt || null,
+          });
+        }
+      } catch (e5) {}
+
+      notifyOpenerAndClose_({
+        ok: true,
+        token: token,
+        email: email,
+        expiresAt: data.expiresAt || null,
+        refreshToken: data.refreshToken || null,
+      });
+      stripTicketFromUrl_();
+      // If this tab is the app (not a popup), show logged-in UI.
+      if (!window.opener || window.opener.closed) {
+        refreshAuthState(function () {});
+      }
+    }
+  );
+  return true;
+}
+
+/** Card "Continue with Google" opens ?sso=google → start popup here. */
+function handleSsoLaunchQuery_() {
+  var params;
+  try {
+    params = new URLSearchParams(location.search || "");
+  } catch (e) {
+    return;
+  }
+  if (params.get("sso") !== "google") return;
+
+  var intent = params.get("intent") === "signup" ? "signup" : "login";
+  var acceptTerms =
+    params.get("acceptTerms") === "1" || params.get("acceptTerms") === "true";
+
+  if (intent === "signup") {
+    setAuthMode("signup");
+    var termsBox = document.getElementById("accept-terms");
+    if (termsBox) termsBox.checked = true;
+  }
+
+  var gate = document.getElementById("auth-gate-hint");
+  if (gate) {
+    gate.style.display = "block";
+    gate.textContent = "Opening Google sign-in popup…";
+  }
+  setLoginError("");
+  setSsoBusy(true);
+
+  if (typeof loginWithOAuth !== "function") {
+    setSsoBusy(false);
+    setLoginError("OAuth helper not loaded.");
+    return;
+  }
+
+  loginWithOAuth({
+    provider: "google",
+    intent: intent,
+    acceptTerms: intent === "signup" ? true : acceptTerms,
+    apiBaseUrl: apiBase(),
+  })
+    .then(function (res) {
+      setSsoBusy(false);
+      if (!res || !res.ok) {
+        setLoginError((res && res.error) || "Google sign-in failed");
+        if (gate) gate.textContent = "Sign in above to use Encrypt and Decrypt.";
+        return;
+      }
+      if (gate) {
+        gate.textContent =
+          "Signed in. Close this window — the Gmail add-on will reload.";
+      }
+      refreshAuthState(function () {});
+      try {
+        // Clean query so refresh does not re-open Google.
+        if (window.history && window.history.replaceState) {
+          window.history.replaceState({}, "", location.pathname);
+        }
+      } catch (e2) {}
+    })
+    .catch(function (err) {
+      setSsoBusy(false);
+      setLoginError(err.message || String(err));
+      if (gate) gate.textContent = "Sign in above to use Encrypt and Decrypt.";
+    });
+}
 
 function setAuthMode(next) {
   _authMode = next === "signup" ? "signup" : "login";
@@ -48,12 +387,10 @@ function setAuthMode(next) {
   var passEl = document.getElementById("login-password");
 
   if (title) title.textContent = _authMode === "signup" ? "Sign up" : "Log in";
-  if (hint) {
-    hint.textContent =
-      _authMode === "signup"
-        ? "Create a SecureDoc account to encrypt and decrypt mail."
-        : "Login is required to encrypt or decrypt mail. Sign in here, or create an account.";
-  }
+  // if (hint) {
+  //   hint.textContent =
+  //     "Encrypt and share documents with identity-locked access.";
+  // }
   if (termsRow) termsRow.style.display = _authMode === "signup" ? "flex" : "none";
   if (otpRow) otpRow.style.display = "none";
   if (otpEl) otpEl.value = "";
@@ -138,44 +475,27 @@ function initAuthUi() {
   }
 
   bindSsoButtons();
-  refreshSsoProviders();
 }
 
 function bindSsoButtons() {
-  var root = document.getElementById("sso-buttons");
-  if (!root || root.dataset.bound) return;
-  root.dataset.bound = "1";
-  root.addEventListener("click", function (ev) {
-    var btn =
-      ev.target && ev.target.closest
-        ? ev.target.closest("[data-provider]")
-        : null;
-    if (!btn) return;
+  var btn = document.getElementById("btn-sso-google");
+  if (!btn || btn.dataset.bound) return;
+  btn.dataset.bound = "1";
+  btn.addEventListener("click", function () {
     onSsoClick({ currentTarget: btn });
   });
 }
 
 function refreshSsoProviders() {
-  if (typeof fetchOAuthProviders !== "function") return;
-  fetchOAuthProviders({ apiBaseUrl: apiBase() })
-    .then(function (info) {
-      var list =
-        (info && info.providers) ||
-        (info && info.data && info.data.providers) ||
-        [];
-      var buttons = document.querySelectorAll("#sso-buttons .btn-sso");
-      for (var i = 0; i < buttons.length; i++) {
-        var p = buttons[i].getAttribute("data-provider");
-        buttons[i].style.display =
-          !list.length || list.indexOf(p) >= 0 ? "" : "none";
-      }
-    })
-    .catch(function () {});
+  /* Google-only UI (same as Chrome extension). */
 }
 
 function setSsoBusy(busy) {
-  var buttons = document.querySelectorAll("#sso-buttons .btn-sso");
-  for (var i = 0; i < buttons.length; i++) buttons[i].disabled = Boolean(busy);
+  var btn = document.getElementById("btn-sso-google");
+  if (btn) {
+    btn.disabled = Boolean(busy);
+    btn.textContent = busy ? "Connecting Google..." : "Continue with Google";
+  }
   var loginBtn = document.getElementById("btn-login");
   if (loginBtn) loginBtn.disabled = Boolean(busy);
 }
@@ -398,45 +718,71 @@ function refreshAuthState(done) {
     if (typeof done === "function") done(ok);
   }
 
-  if (typeof ensureAuthSession !== "function") {
-    finish(false, null, null);
-    return;
-  }
-
-  ensureAuthSession({ apiBaseUrl: apiBase() }).then(function (auth) {
-    if (auth && auth.ok && auth.authenticated) {
-      var email = auth.email || (auth.data && auth.data.email) || null;
-      _sessionToken =
-        auth.token ||
-        (auth.data && auth.data.token) ||
-        (typeof getStoredSession === "function" &&
-          getStoredSession() &&
-          getStoredSession().token) ||
-        "";
-      var sub = auth.subscription || (auth.data && auth.data.subscription) || {};
-      _subscriptionActive = sub.subscriptionActive === true;
-      syncSessionToAppsScript({
-        token: _sessionToken,
-        email: email,
-        expiresAt: auth.expiresAt || (auth.data && auth.data.expiresAt),
-      });
-      if (typeof checkSenderSubscription === "function" && email) {
-        checkSenderSubscription({
-          apiBaseUrl: apiBase(),
-          email: email,
-        }).then(function (subRes) {
-          _subscriptionActive = Boolean(
-            subRes && subRes.ok && subRes.subscriptionActive
-          );
-          finish(true, email, subRes && subRes.ok ? subRes : sub);
-        });
-        return;
-      }
-      finish(true, email, sub);
+  function runEnsure() {
+    if (typeof ensureAuthSession !== "function") {
+      finish(false, null, null);
       return;
     }
-    finish(false, null, null);
+
+    ensureAuthSession({ apiBaseUrl: apiBase() }).then(function (auth) {
+      if (auth && auth.ok && auth.authenticated) {
+        var email = auth.email || (auth.data && auth.data.email) || null;
+        _sessionToken =
+          auth.token ||
+          (auth.data && auth.data.token) ||
+          storedSessionToken() ||
+          "";
+        var sub = auth.subscription || (auth.data && auth.data.subscription) || {};
+        _subscriptionActive = sub.subscriptionActive === true;
+        syncSessionToAppsScript({
+          token: _sessionToken,
+          email: email,
+          expiresAt: auth.expiresAt || (auth.data && auth.data.expiresAt),
+        });
+        finish(true, email, sub);
+        return;
+      }
+      finish(false, null, null);
+    });
+  }
+
+  // Card login lives in UserProperties — hydrate local session before API check.
+  hydrateSessionFromAppsScript_(function () {
+    runEnsure();
   });
+}
+
+function hydrateSessionFromAppsScript_(done) {
+  try {
+    if (
+      typeof google === "undefined" ||
+      !google.script ||
+      !google.script.run ||
+      typeof google.script.run.getWorkspaceSession !== "function"
+    ) {
+      if (typeof done === "function") done(null);
+      return;
+    }
+    google.script.run
+      .withSuccessHandler(function (session) {
+        try {
+          if (session && session.token && typeof saveSession === "function") {
+            saveSession({
+              token: session.token,
+              email: session.email || "",
+              expiresAt: session.expiresAt || null,
+            });
+          }
+        } catch (e0) {}
+        if (typeof done === "function") done(session || null);
+      })
+      .withFailureHandler(function () {
+        if (typeof done === "function") done(null);
+      })
+      .getWorkspaceSession();
+  } catch (e) {
+    if (typeof done === "function") done(null);
+  }
 }
 
 function syncSessionToAppsScript(session) {
@@ -494,50 +840,29 @@ function requireAuthAndSubscription(done) {
     _sessionToken =
       auth.token ||
       (auth.data && auth.data.token) ||
-      (typeof getStoredSession === "function" &&
-        getStoredSession() &&
-        getStoredSession().token) ||
+      storedSessionToken() ||
       "";
 
     var sub = auth.subscription || (auth.data && auth.data.subscription) || {};
-    var active =
-      sub.subscriptionActive === true ||
-      (sub.subscriptionExpiresAt &&
-        new Date(sub.subscriptionExpiresAt).getTime() > Date.now());
+    _subscriptionActive = sub.subscriptionActive === true;
+    updateSubscriptionLabel(sub);
 
-    // Prefer dedicated public subscription-check (same as Outlook OnMessageSend).
-    var check =
-      typeof checkSenderSubscription === "function"
-        ? checkSenderSubscription({
-            apiBaseUrl: apiBase(),
-            email: _sessionEmail,
-          })
-        : Promise.resolve({
-            ok: active,
-            subscriptionActive: active,
-          });
-
-    check.then(function (subRes) {
-      _subscriptionActive = Boolean(
-        subRes && subRes.ok && subRes.subscriptionActive
+    if (!_subscriptionActive) {
+      done(
+        false,
+        (sub && sub.error) ||
+          "Subscription expired or inactive. Subscribe to encrypt and send.",
+        auth
       );
-      updateSubscriptionLabel(subRes || sub);
-      if (!_subscriptionActive) {
-        done(
-          false,
-          (subRes && subRes.error) ||
-            "Subscription expired or inactive. Subscribe to encrypt and send.",
-          auth
-        );
-        return;
-      }
-      syncSessionToAppsScript({
-        token: _sessionToken,
-        email: _sessionEmail,
-        expiresAt: auth.expiresAt || (auth.data && auth.data.expiresAt),
-      });
-      done(true, null, auth);
+      return;
+    }
+
+    syncSessionToAppsScript({
+      token: _sessionToken,
+      email: _sessionEmail,
+      expiresAt: auth.expiresAt || (auth.data && auth.data.expiresAt),
     });
+    done(true, null, auth);
   });
 }
 
@@ -601,9 +926,7 @@ function requireAuthOrPrompt(done) {
       _sessionToken =
         auth.token ||
         (auth.data && auth.data.token) ||
-        (typeof getStoredSession === "function" &&
-          getStoredSession() &&
-          getStoredSession().token) ||
+        storedSessionToken() ||
         _sessionToken;
       syncSessionToAppsScript({
         token: _sessionToken,
@@ -706,17 +1029,60 @@ function bindEncryptUi() {
   }
 }
 
-function collectEncryptForm() {
+function setEncryptButtonsDisabled(disabled) {
+  var btn = document.getElementById("btn-encrypt");
+  var btnSend = document.getElementById("btn-encrypt-send");
+  if (btn) btn.disabled = Boolean(disabled);
+  if (btnSend) btnSend.disabled = Boolean(disabled);
+  if (_recipientInput && typeof _recipientInput.setDisabled === "function") {
+    _recipientInput.setDisabled(disabled);
+  }
   var toEl = document.getElementById("encrypt-to");
+  if (toEl) toEl.disabled = Boolean(disabled);
+  var subEl = document.getElementById("encrypt-subject");
+  if (subEl) subEl.disabled = Boolean(disabled);
+  var msgEl = document.getElementById("encrypt-message");
+  if (msgEl) msgEl.disabled = Boolean(disabled);
+  var fileEl = document.getElementById("encrypt-file");
+  if (fileEl) fileEl.disabled = Boolean(disabled);
+}
+
+function collectEncryptForm() {
   var subEl = document.getElementById("encrypt-subject");
   var msgEl = document.getElementById("encrypt-message");
   var fileEl = document.getElementById("encrypt-file");
+  var recipients = [];
+  if (_recipientInput && typeof _recipientInput.getEmails === "function") {
+    recipients = _recipientInput.getEmails();
+  } else {
+    var toEl = document.getElementById("encrypt-to");
+    var single = toEl ? String(toEl.value || "").trim() : "";
+    if (single) {
+      recipients = single.split(/[,;\s]+/).map(function (s) {
+        return String(s || "").trim();
+      }).filter(Boolean);
+    }
+  }
   return {
-    to: toEl ? String(toEl.value || "").trim() : "",
+    recipients: recipients,
     subject: subEl ? String(subEl.value || "").trim() : "",
     message: msgEl ? String(msgEl.value || "") : "",
     file: fileEl && fileEl.files && fileEl.files[0] ? fileEl.files[0] : null,
   };
+}
+
+function clearEncryptForm_() {
+  if (_recipientInput && typeof _recipientInput.clear === "function") {
+    _recipientInput.clear();
+  }
+  var toEl = document.getElementById("encrypt-to");
+  if (toEl) toEl.value = "";
+  var subEl = document.getElementById("encrypt-subject");
+  if (subEl) subEl.value = "";
+  var msgEl = document.getElementById("encrypt-message");
+  if (msgEl) msgEl.value = "";
+  var fileEl = document.getElementById("encrypt-file");
+  if (fileEl) fileEl.value = "";
 }
 
 function readFileAsBase64(file) {
@@ -734,16 +1100,122 @@ function readFileAsBase64(file) {
   });
 }
 
-function setEncryptButtonsDisabled(disabled) {
-  var btn = document.getElementById("btn-encrypt");
-  var btnSend = document.getElementById("btn-encrypt-send");
-  if (btn) btn.disabled = Boolean(disabled);
-  if (btnSend) btnSend.disabled = Boolean(disabled);
+function encryptForRecipient_(recipientEmail, form, fileParts) {
+  var payload = {
+    recipientEmail: recipientEmail,
+    subject: form.subject,
+    message: form.message || "",
+  };
+  if (fileParts.fileBase64) {
+    payload.fileBase64 = fileParts.fileBase64;
+    payload.fileName = fileParts.fileName;
+    payload.mimeType = fileParts.mimeType;
+  }
+  return apiJson("/files/encrypt", {
+    method: "POST",
+    token: _sessionToken,
+    body: payload,
+  }).then(function (out) {
+    var res = out.res;
+    var data = out.data || {};
+    if (!res.ok) {
+      var code = data.code || "";
+      if (code === "FILE_EXTENSION_BLOCKED") {
+        throw new Error(
+          data.error ||
+            "This file extension is blocked by admin and cannot be encrypted."
+        );
+      }
+      if (code === "SUBSCRIPTION_EXPIRED" || res.status === 403) {
+        throw new Error(
+          data.error || "Subscription expired. Renew to encrypt and send."
+        );
+      }
+      if (res.status === 401) {
+        throw new Error(data.error || "Login required. Sign in again.");
+      }
+      throw new Error(data.error || "Encrypt failed.");
+    }
+    return {
+      ok: true,
+      encrypted: true,
+      messageCipherText: data.messageCipherText || null,
+      fileCipherText: data.fileCipherText || null,
+      attachment: data.attachment || null,
+      subject: data.subject || form.subject,
+      recipientUuid: data.recipientUuid || null,
+      recipientEmail: data.recipientEmail || recipientEmail,
+      mailMetadata: data.mailMetadata || null,
+      contentKind: data.contentKind || null,
+    };
+  });
+}
+
+function sendEncryptedToRecipient_(enc, recipientEmail, accessToken, from, appUrl) {
+  var attachment = enc.attachment || {};
+  return apiJson("/files/send", {
+    method: "POST",
+    token: _sessionToken,
+    body: {
+      recipientEmail: recipientEmail,
+      recipientUuid: enc.recipientUuid,
+      subject: enc.subject,
+      message: enc.messageCipherText || "",
+      filename: attachment.fileName || "message.txt",
+      contentKind: enc.fileCipherText ? "file" : "message",
+      clientSend: true,
+    },
+  }).then(function () {
+    if (typeof sendEncryptedEmailViaGmail !== "function") {
+      throw new Error("Gmail send helper not loaded.");
+    }
+    return sendEncryptedEmailViaGmail({
+      accessToken: accessToken,
+      from: from,
+      to: recipientEmail,
+      subject: enc.subject,
+      message: enc.messageCipherText || "",
+      attachmentName: attachment.fileName,
+      attachmentBase64:
+        attachment.attachmentBase64 || attachment.base64 || null,
+      appUrl: appUrl,
+      mailMetadata: enc.mailMetadata || null,
+      onProgress: setComposeStatus,
+    });
+  });
+}
+
+var _gmailSendTokenCache = null;
+
+function ensureSendToken_() {
+  if (_gmailSendTokenCache && _gmailSendTokenCache.accessToken) {
+    return Promise.resolve(_gmailSendTokenCache);
+  }
+  setComposeStatus("Requesting Gmail send token…");
+  return apiJson("/auth/gmail/send-token", {
+    method: "POST",
+    token: _sessionToken,
+    body: {},
+  }).then(function (tokenOut) {
+    var tokenRes = tokenOut.res;
+    var tokenData = tokenOut.data || {};
+    if (!tokenRes.ok) {
+      throw new Error(
+        (tokenData.error || "Gmail not connected.") +
+          " Allow Gmail once in the Chrome extension, then Encrypt and send again."
+      );
+    }
+    _gmailSendTokenCache = {
+      accessToken: tokenData.accessToken,
+      from: tokenData.from || _sessionEmail,
+      appUrl: tokenData.appUrl || "",
+    };
+    return _gmailSendTokenCache;
+  });
 }
 
 /**
- * Same pipeline as Chrome extension / Outlook send:
- * login token → subscription → /files/encrypt → optional Gmail API send.
+ * Encrypt pipeline: recipient + subject + message → optional Gmail send.
  */
 function onEncryptClick(options) {
   options = options || {};
@@ -756,8 +1228,8 @@ function onEncryptClick(options) {
     }
 
     var form = collectEncryptForm();
-    if (!form.to) {
-      setComposeStatus("Recipient email is required.");
+    if (!form.recipients || !form.recipients.length) {
+      setComposeStatus("Add at least one recipient (type email or pick a contact).");
       return;
     }
     if (!String(form.message || "").trim() && !form.file) {
@@ -765,179 +1237,106 @@ function onEncryptClick(options) {
       return;
     }
 
-    var blockedCheck = form.file
-      ? apiJson("/public/file-policy", { method: "GET" }).then(function (out) {
-          var data = (out && out.data) || {};
-          var blocked = Array.isArray(data.blockedFileExtensions)
-            ? data.blockedFileExtensions
-            : [];
-          var name = String(form.file.name || "");
-          var dot = name.lastIndexOf(".");
-          var ext =
-            dot > 0
-              ? name
-                  .slice(dot + 1)
-                  .toLowerCase()
-                  .replace(/[^a-z0-9]/g, "")
-              : "";
-          if (ext && blocked.indexOf(ext) !== -1) {
-            throw new Error(
-              "." + ext + " files are blocked by admin and cannot be encrypted."
-            );
-          }
-        })
-      : Promise.resolve();
+    var selfEmail =
+      typeof normalizeEmailAddress === "function"
+        ? normalizeEmailAddress(_sessionEmail)
+        : String(_sessionEmail || "")
+            .trim()
+            .toLowerCase();
+    var toNorm =
+      typeof normalizeEmailAddress === "function"
+        ? normalizeEmailAddress(form.recipients[0])
+        : String(form.recipients[0] || "")
+            .trim()
+            .toLowerCase();
+    if (selfEmail && toNorm && selfEmail === toNorm) {
+      setComposeStatus("You cannot send to yourself.");
+      return;
+    }
+
+    if (form.file && form.file.size > 15 * 1024 * 1024) {
+      setComposeStatus(
+        "File should be under ~15 MB before encryption so the Gmail message stays within limits."
+      );
+      return;
+    }
 
     setEncryptButtonsDisabled(true);
     hideEncryptSuccess();
     setComposeStatus(
-      wantSend ? "Checking login & subscription, then encrypting…" : "Encrypting…"
+      wantSend
+        ? "Checking login & subscription, then encrypting…"
+        : "Encrypting…"
     );
 
-    blockedCheck
-      .then(function () {
-        return form.file
-          ? readFileAsBase64(form.file).then(function (b64) {
-              return {
-                fileBase64: b64,
-                fileName: form.file.name || "document.bin",
-                mimeType: form.file.type || "application/octet-stream",
-              };
-            })
-          : Promise.resolve({});
-      })
+    var filePromise = form.file
+      ? readFileAsBase64(form.file).then(function (b64) {
+          return {
+            fileBase64: b64,
+            fileName: form.file.name || "document.bin",
+            mimeType: form.file.type || "application/octet-stream",
+          };
+        })
+      : Promise.resolve({});
+
+    filePromise
       .then(function (fileParts) {
-        var payload = {
-          recipientEmail: form.to,
-          subject: form.subject,
-          message: form.message || "",
-        };
-        if (fileParts.fileBase64) {
-          payload.fileBase64 = fileParts.fileBase64;
-          payload.fileName = fileParts.fileName;
-          payload.mimeType = fileParts.mimeType;
-        }
+        var chain = Promise.resolve();
+        var lastEnc = null;
+        var sent = [];
 
-        // Authenticated encrypt (same as Chrome extension) — enforces sender subscription server-side.
-        return apiJson("/files/encrypt", {
-          method: "POST",
-          token: _sessionToken,
-          body: payload,
+        form.recipients.forEach(function (recipientEmail, index) {
+          chain = chain.then(function () {
+            setComposeStatus(
+              "Encrypting " +
+                (index + 1) +
+                "/" +
+                form.recipients.length +
+                ": " +
+                recipientEmail +
+                "…"
+            );
+            return encryptForRecipient_(recipientEmail, form, fileParts).then(
+              function (enc) {
+                lastEnc = enc;
+                if (!wantSend) return enc;
+                return ensureSendToken_().then(function (tok) {
+                  setComposeStatus(
+                    "Sending encrypted mail to " + recipientEmail + "…"
+                  );
+                  return sendEncryptedToRecipient_(
+                    enc,
+                    recipientEmail,
+                    tok.accessToken,
+                    tok.from,
+                    tok.appUrl
+                  ).then(function () {
+                    sent.push(recipientEmail);
+                    return enc;
+                  });
+                });
+              }
+            );
+          });
         });
-      })
-      .then(function (out) {
-        var res = out.res;
-        var data = out.data || {};
-        if (!res.ok) {
-          var code = data.code || "";
-          if (code === "FILE_EXTENSION_BLOCKED") {
-            throw new Error(
-              data.error ||
-                "This file extension is blocked by admin and cannot be encrypted."
-            );
-          }
-          if (code === "SUBSCRIPTION_EXPIRED" || res.status === 403) {
-            throw new Error(
-              data.error ||
-                "Subscription expired. Renew to encrypt and send."
-            );
-          }
-          if (res.status === 401) {
-            throw new Error(
-              data.error || "Login required. Sign in again."
-            );
-          }
-          throw new Error(data.error || "Encrypt failed.");
-        }
 
-        var enc = {
-          ok: true,
-          encrypted: true,
-          messageCipherText: data.messageCipherText || null,
-          fileCipherText: data.fileCipherText || null,
-          attachment: data.attachment || null,
-          subject: data.subject || form.subject,
-          recipientUuid: data.recipientUuid || null,
-          recipientEmail: data.recipientEmail || form.to,
-          mailMetadata: data.mailMetadata || null,
-          contentKind: data.contentKind || null,
-        };
-        showEncryptSuccess(enc);
-
-        if (!wantSend) {
+        return chain.then(function () {
+          if (lastEnc) showEncryptSuccess(lastEnc);
           setEncryptButtonsDisabled(false);
-          setComposeStatus("Encrypted. Copy ciphertext into Gmail, or use Encrypt and send.");
-          return null;
-        }
-
-        setComposeStatus("Encrypt OK. Requesting Gmail send token…");
-        return apiJson("/auth/gmail/send-token", {
-          method: "POST",
-          token: _sessionToken,
-          body: {},
-        }).then(function (tokenOut) {
-          return { enc: enc, tokenOut: tokenOut, to: form.to };
-        });
-      })
-      .then(function (pack) {
-        if (!pack) return;
-
-        var tokenRes = pack.tokenOut.res;
-        var tokenData = pack.tokenOut.data || {};
-        if (!tokenRes.ok) {
-          showEncryptSuccess(pack.enc);
-          setEncryptButtonsDisabled(false);
-          setComposeStatus(
-            (tokenData.error || "Gmail not connected.") +
-              " Ciphertext is ready — allow Gmail once in the Chrome extension, then Encrypt and send again."
-          );
-          return;
-        }
-
-        var accessToken = tokenData.accessToken;
-        var from = tokenData.from || _sessionEmail;
-        var appUrl = tokenData.appUrl || "";
-        var enc = pack.enc;
-        var attachment = enc.attachment || {};
-
-        // Notify server send path (same as extension clientSend).
-        return apiJson("/files/send", {
-          method: "POST",
-          token: _sessionToken,
-          body: {
-            recipientEmail: pack.to,
-            recipientUuid: enc.recipientUuid,
-            subject: enc.subject,
-            message: enc.messageCipherText || "",
-            filename: attachment.fileName || "message.txt",
-            contentKind: enc.fileCipherText ? "file" : "message",
-            clientSend: true,
-          },
-        }).then(function () {
-          if (typeof sendEncryptedEmailViaGmail !== "function") {
-            throw new Error("Gmail send helper not loaded.");
-          }
-          setComposeStatus("Sending encrypted mail via Gmail…");
-          return sendEncryptedEmailViaGmail({
-            accessToken: accessToken,
-            from: from,
-            to: pack.to,
-            subject: enc.subject,
-            message: enc.messageCipherText || "",
-            attachmentName: attachment.fileName,
-            attachmentBase64:
-              attachment.attachmentBase64 || attachment.base64 || null,
-            appUrl: appUrl,
-            mailMetadata: enc.mailMetadata || null,
-            onProgress: setComposeStatus,
-          }).then(function () {
-            setEncryptButtonsDisabled(false);
+          if (wantSend) {
             var okLabel = document.getElementById("encrypt-success-label");
             if (okLabel) {
               okLabel.textContent = "✔ Encrypted and sent via Gmail";
             }
-            setComposeStatus("Sent from " + from + " to " + pack.to + ".");
-          });
+            setComposeStatus(
+              "Sent to " + (sent.length ? sent.join(", ") : "recipients") + "."
+            );
+            clearEncryptForm_();
+          } else {
+            setComposeStatus(
+              "Encrypted. Copy ciphertext into Gmail, or use Encrypt and send."
+            );
+          }
         });
       })
       .catch(function (err) {

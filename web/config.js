@@ -1,22 +1,20 @@
 (function (g) {
-  var ENV = {
+  const ENV = {
     API_BASE_URL: "https://server-nine-rosy.vercel.app/api",
     LOGIN_WEB_URL: "https://admin-panel-amber-nine.vercel.app/login",
-    ADDIN_HTTPS_ORIGIN: "https://outlook-seven-sandy.vercel.app",
-    OPEN_LOGIN_PATH: "/open-login.html",
-    SITE_URL: "https://www.securedocshare.example.com",
     TERMS_URL: "https://admin-panel-amber-nine.vercel.app/terms",
     SESSION_STORAGE_KEY: "securedoc_workspace_session",
-    TASKPANE_COMMAND_ID: "SecureDocLoginButton",
+    OAUTH_POPUP_DONE_ORIGIN: "https://server-nine-rosy.vercel.app",
+    WEB_APP_EXEC_PATH:
+      "/macros/s/AKfycbzCvUVD8GnLvsGNpux6euGd2WJrYUmGXEE3qp-NK-emFZSFAvN5dPOkIumQLmgcm5RRVA/exec",
     LS_LOGIN_URL_KEY: "securedoc_login_url",
     LS_API_BASE_KEY: "securedoc_api_base",
-    LS_ADDIN_ORIGIN_KEY: "securedoc_addin_origin",
   };
 
   function readLs(key) {
     try {
       if (typeof localStorage === "undefined") return null;
-      var v = localStorage.getItem(key);
+      const v = localStorage.getItem(key);
       return v ? String(v).trim() : null;
     } catch (e) {
       return null;
@@ -27,56 +25,42 @@
     return String(url || "").replace(/\/$/, "");
   }
 
-  var SecureDocConfig = {
+  function ensureApiBase(url) {
+    const base = stripSlash(url);
+    if (!base) return "";
+    if (/\/api$/i.test(base)) return base;
+    return base + "/api";
+  }
+
+  const SecureDocConfig = {
     ENV: ENV,
+
     getApiBaseUrl: function () {
-      return stripSlash(readLs(ENV.LS_API_BASE_KEY) || ENV.API_BASE_URL);
+      return ensureApiBase(readLs(ENV.LS_API_BASE_KEY) || ENV.API_BASE_URL);
     },
+
     getLoginWebUrl: function () {
       return readLs(ENV.LS_LOGIN_URL_KEY) || ENV.LOGIN_WEB_URL;
     },
-    getAddinHttpsOrigin: function () {
-      var custom = readLs(ENV.LS_ADDIN_ORIGIN_KEY);
-      if (custom) return stripSlash(custom);
-      try {
-        if (
-          typeof location !== "undefined" &&
-          location.origin &&
-          /^https:\/\//i.test(location.origin)
-        ) {
-          return stripSlash(location.origin);
-        }
-      } catch (e) {}
-      return stripSlash(ENV.ADDIN_HTTPS_ORIGIN);
-    },
-    getSiteUrl: function () {
-      return ENV.SITE_URL;
-    },
+
     getTermsUrl: function () {
       return ENV.TERMS_URL;
     },
+
     getSessionStorageKey: function () {
       return ENV.SESSION_STORAGE_KEY;
     },
-    getTaskpaneCommandId: function () {
-      return ENV.TASKPANE_COMMAND_ID;
+
+    getWebAppExecPath: function () {
+      return ENV.WEB_APP_EXEC_PATH;
     },
-    getClickableLoginUrl: function () {
-      var adminLogin = SecureDocConfig.getLoginWebUrl();
-      return (
-        SecureDocConfig.getAddinHttpsOrigin() +
-        ENV.OPEN_LOGIN_PATH +
-        "?to=" +
-        encodeURIComponent(adminLogin)
-      );
-    },
+
+    ensureApiBase: ensureApiBase,
   };
 
   g.SecureDocConfig = SecureDocConfig;
   g.DEFAULT_API_BASE = SecureDocConfig.getApiBaseUrl();
   g.LOGIN_WEB_URL = SecureDocConfig.getLoginWebUrl();
-  g.ADDIN_HTTPS_ORIGIN = SecureDocConfig.getAddinHttpsOrigin();
-  g.SITE_URL = SecureDocConfig.getSiteUrl();
   g.TERMS_URL = SecureDocConfig.getTermsUrl();
   g.SESSION_STORAGE_KEY = SecureDocConfig.getSessionStorageKey();
 })(typeof globalThis !== "undefined" ? globalThis : window);
