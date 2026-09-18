@@ -1,10 +1,29 @@
 const ADMIN_URL = "https://admin-panel-amber-nine.vercel.app";
 const API_BASE = "https://server-nine-rosy.vercel.app/api";
+const APP_ORIGIN = API_BASE.replace(/\/api\/?$/, "");
 const SESSION_KEY = "SDS_WORKSPACE_SESSION";
 const WEB_APP_DEPLOYMENT_ID =
   "AKfycbzCvUVD8GnLvsGNpux6euGd2WJrYUmGXEE3qp-NK-emFZSFAvN5dPOkIumQLmgcm5RRVA";
 const WEB_APP_URL =
   "https://script.google.com/macros/s/" + WEB_APP_DEPLOYMENT_ID + "/exec";
+
+/**
+ * From server/.env GOOGLE_GMAIL_* — Workspace Google login (Apps Script OAuth2).
+ * Prefer Script Properties via configureGoogleOAuthCredentials(); these are fallbacks.
+ */
+const GOOGLE_OAUTH_CLIENT_ID =
+  "387608086587-s1h4da154kpbupqdbmghup6k87e3gp0b.apps.googleusercontent.com";
+const GOOGLE_OAUTH_CLIENT_SECRET = "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";
+
+/** OpenID + Gmail offline scopes (refresh token stored in SecureDocShare DB). */
+const GOOGLE_OAUTH_SCOPES = [
+  "openid",
+  "email",
+  "profile",
+  "https://www.googleapis.com/auth/gmail.send",
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/gmail.compose",
+];
 
 function onHomepage(e) {
   return buildMainCard_(e);
@@ -20,6 +39,262 @@ function onGmailMessage(e) {
 
 function onGmailCompose(e) {
   return buildComposeDirectCard_(e);
+}
+
+/**
+ * Workspace Google login via Apps Script OAuth2 library (OpenID Connect).
+ * Flow: Continue with Google → Google consent → authCallback → verify id_token
+ * on SecureDocShare API → store JWT session + Gmail refresh token in DB.
+ *
+ * Redirect URI (add in Google Cloud OAuth client):
+ *   https://script.google.com/macros/d/<SCRIPT_ID>/usercallback
+ * Call getGoogleOAuthRedirectUri() in the Apps Script editor to copy it.
+ *
+ * Requires library: OAuth2
+ *   (1B7FSrk5Zi6L1rSxxTDgDEUsPzlukDsi4KGuTMorsTQHhGBzBkMun4iDF)
+ */
+
+var GOOGLE_OAUTH_INTENT_KEY = "SDS_GOOGLE_OAUTH_INTENT";
+
+/** Same web client as server GOOGLE_GMAIL_* (identity + Gmail offline). */
+function getGoogleOAuthClientId_() {
+  var fromProps = PropertiesService.getScriptProperties().getProperty(
+    "GOOGLE_OAUTH_CLIENT_ID"
+  );
+  if (fromProps) return String(fromProps).trim();
+  return String(GOOGLE_OAUTH_CLIENT_ID || "").trim();
+}
+
+function getGoogleOAuthClientSecret_() {
+  var fromProps = PropertiesService.getScriptProperties().getProperty(
+    "GOOGLE_OAUTH_CLIENT_SECRET"
+  );
+  if (fromProps) return String(fromProps).trim();
+  return String(GOOGLE_OAUTH_CLIENT_SECRET || "").trim();
+}
+
+/** One-time: copy env values into Script Properties (run from editor). */
+function configureGoogleOAuthCredentials() {
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty("GOOGLE_OAUTH_CLIENT_ID", getGoogleOAuthClientId_());
+  props.setProperty("GOOGLE_OAUTH_CLIENT_SECRET", getGoogleOAuthClientSecret_());
+  return {
+    ok: true,
+    clientId: getGoogleOAuthClientId_(),
+    redirectUri: getGoogleOAuthRedirectUri(),
+  };
+}
+
+function getGoogleOAuthRedirectUri() {
+  return (
+    "https://script.google.com/macros/d/" +
+    ScriptApp.getScriptId() +
+    "/usercallback"
+  );
+}
+
+function getGoogleOAuthService_() {
+  var clientId = getGoogleOAuthClientId_();
+  var clientSecret = getGoogleOAuthClientSecret_();
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      "Google OAuth client id/secret missing. Run configureGoogleOAuthCredentials()."
+    );
+  }
+  if (typeof OAuth2 === "undefined" || !OAuth2.createService) {
+    throw new Error(
+      "OAuth2 library missing. Add library 1B7FSrk5Zi6L1rSxxTDgDEUsPzlukDsi4KGuTMorsTQHhGBzBkMun4iDF"
+    );
+  }
+
+  return OAuth2.createService("securedoc_google")
+    .setAuthorizationBaseUrl("https://accounts.google.com/o/oauth2/v2/auth")
+    .setTokenUrl("https://oauth2.googleapis.com/token")
+    .setClientId(clientId)
+    .setClientSecret(clientSecret)
+    .setCallbackFunction("authCallback")
+    .setPropertyStore(PropertiesService.getUserProperties())
+    .setScope(GOOGLE_OAUTH_SCOPES.join(" "))
+    .setParam("access_type", "offline")
+    .setParam("prompt", "consent")
+    .setParam("include_granted_scopes", "true");
+}
+
+function saveGoogleOAuthIntent_(intent, acceptTerms) {
+  PropertiesService.getUserProperties().setProperty(
+    GOOGLE_OAUTH_INTENT_KEY,
+    JSON.stringify({
+      intent: intent === "signup" ? "signup" : "login",
+      acceptTerms: Boolean(acceptTerms),
+    })
+  );
+}
+
+function loadGoogleOAuthIntent_() {
+  try {
+    var raw = PropertiesService.getUserProperties().getProperty(
+      GOOGLE_OAUTH_INTENT_KEY
+    );
+    if (!raw) return { intent: "login", acceptTerms: false };
+    var parsed = JSON.parse(raw);
+    return {
+      intent: parsed.intent === "signup" ? "signup" : "login",
+      acceptTerms: Boolean(parsed.acceptTerms),
+    };
+  } catch (e) {
+    return { intent: "login", acceptTerms: false };
+  }
+}
+
+/**
+ * Start Google login/signup. Returns authorization URL for OpenLink / top redirect.
+ * @param {{intent?: string, acceptTerms?: boolean}|string=} options
+ */
+function getGoogleLoginUrl(options) {
+  options = options || {};
+  if (typeof options === "string") {
+    options = { intent: options };
+  }
+  var intent = options.intent === "signup" ? "signup" : "login";
+  var acceptTerms = options.acceptTerms === true || intent === "signup";
+  if (intent === "signup" && !acceptTerms) {
+    throw new Error("Accept Terms & Conditions to sign up with Google.");
+  }
+  saveGoogleOAuthIntent_(intent, acceptTerms);
+
+  var service = getGoogleOAuthService_();
+  // Always re-consent so we can capture refresh token for Gmail send when missing.
+  return service.getAuthorizationUrl();
+}
+
+/**
+ * OAuth2 library callback — Google verified identity, then our DB session.
+ */
+function authCallback(request) {
+  var service = getGoogleOAuthService_();
+  var ok = false;
+  try {
+    ok = service.handleCallback(request);
+  } catch (err) {
+    return googleOAuthResultPage_(false, String(err.message || err));
+  }
+  if (!ok) {
+    return googleOAuthResultPage_(false, "Google authentication failed.");
+  }
+
+  var idToken = "";
+  try {
+    if (typeof service.getIdToken === "function") {
+      idToken = String(service.getIdToken() || "");
+    }
+  } catch (e0) {}
+  if (!idToken) {
+    try {
+      var tok = service.getToken();
+      idToken = String((tok && tok.id_token) || "");
+    } catch (e1) {}
+  }
+  if (!idToken) {
+    return googleOAuthResultPage_(
+      false,
+      "Google did not return an id_token. Ensure openid scope is granted."
+    );
+  }
+
+  var refreshToken = "";
+  var scope = "";
+  try {
+    var tokenBag = service.getToken();
+    refreshToken = String((tokenBag && tokenBag.refresh_token) || "");
+    scope = String((tokenBag && tokenBag.scope) || GOOGLE_OAUTH_SCOPES.join(" "));
+  } catch (e2) {}
+
+  // Extra identity check against OpenID userinfo (not browser-supplied email).
+  try {
+    var access = service.getAccessToken();
+    if (access) {
+      var infoRes = UrlFetchApp.fetch(
+        "https://openidconnect.googleapis.com/v1/userinfo",
+        {
+          headers: { Authorization: "Bearer " + access },
+          muteHttpExceptions: true,
+        }
+      );
+      if (infoRes.getResponseCode() >= 200 && infoRes.getResponseCode() < 300) {
+        var info = JSON.parse(infoRes.getContentText() || "{}");
+        if (info.email_verified === false) {
+          return googleOAuthResultPage_(false, "Google email is not verified.");
+        }
+      }
+    }
+  } catch (e3) {}
+
+  var intentState = loadGoogleOAuthIntent_();
+  var login = apiLoginGoogle_({
+    idToken: idToken,
+    gmailRefreshToken: refreshToken || null,
+    gmailScopes: scope,
+    intent: intentState.intent,
+    acceptTerms: intentState.acceptTerms,
+  });
+
+  if (!login.ok) {
+    return googleOAuthResultPage_(false, login.error || "Sign-in failed");
+  }
+
+  saveWorkspaceSession({
+    token: login.token,
+    email: login.email,
+    expiresAt: login.expiresAt || null,
+  });
+
+  try {
+    PropertiesService.getUserProperties().deleteProperty(GOOGLE_OAUTH_INTENT_KEY);
+  } catch (e4) {}
+
+  // Land on the Workspace web app (not script.google.com/home).
+  var appUrl = String(WEB_APP_URL || "").split("?")[0];
+  if (appUrl) {
+    return HtmlService.createHtmlOutput(
+      "<!DOCTYPE html><html><body style='font-family:system-ui,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
+        "<p style='font-size:18px;font-weight:700'>SecureDocShare</p>" +
+        "<p style='color:#2bb3a0'>Signed in as " +
+        escapeHtml_(login.email || "user") +
+        "</p>" +
+        "<p style='color:#9db4bd'>Please go back to Gmail and refresh the page to continue.</p>" +
+        "<script>window.top.location.replace(" +
+        JSON.stringify(appUrl) +
+        ");</script>" +
+        "<p><a style='color:#2bb3a0' href='" +
+        escapeHtml_(appUrl) +
+        "'>Continue</a></p>" +
+        "</body></html>"
+    ).setTitle("Signed in");
+  }
+
+  return googleOAuthResultPage_(true, login.email || "Signed in");
+}
+
+function googleOAuthResultPage_(success, detail) {
+  var title = success ? "Signed in" : "Sign-in failed";
+  var color = success ? "#2bb3a0" : "#ff6b7a";
+  var msg = success
+    ? "Signed in as " + escapeHtml_(detail) + ". Close this window and return to Gmail."
+    : escapeHtml_(detail);
+  return HtmlService.createHtmlOutput(
+    "<!DOCTYPE html><html><body style='font-family:system-ui,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
+      "<p style='font-size:18px;font-weight:700'>SecureDocShare</p>" +
+      "<h2 style='color:" +
+      color +
+      "'>" +
+      title +
+      "</h2>" +
+      "<p>" +
+      msg +
+      "</p>" +
+      "<script>setTimeout(function(){try{window.close();}catch(e){}},1200);</script>" +
+      "</body></html>"
+  ).setTitle(title);
 }
 
 function cardHeader_(title, subtitle) {
@@ -158,7 +433,8 @@ function setCardAuthMode_(mode) {
 }
 
 /**
- * Account section — same options as Chrome extension:
+ * Account section — login / signup options:
+
  * Log in / Sign up, email+password, OTP on signup, Continue with Google.
  */
 function buildLoginSection_(e) {
@@ -224,22 +500,16 @@ function buildLoginSection_(e) {
     )
   );
 
-  var googleUrl = buildGoogleOAuthStartUrl_(
-    isSignup ? "signup" : "login",
-    true
+  section.addWidget(
+    CardService.newButtonSet().addButton(
+      CardService.newTextButton()
+        .setText("Continue with Google")
+        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+        .setOnClickAction(
+          CardService.newAction().setFunctionName("onCardGoogleSignIn_")
+        )
+    )
   );
-  if (googleUrl) {
-    section.addWidget(
-      CardService.newButtonSet().addButton(
-        CardService.newTextButton()
-          .setText("Continue with Google")
-          .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-          .setOnClickAction(
-            CardService.newAction().setFunctionName("onCardGoogleSignIn_")
-          )
-      )
-    );
-  }
 
   section.addWidget(
     CardService.newButtonSet().addButton(
@@ -260,25 +530,6 @@ function buildLoginSection_(e) {
  
 
   return section;
-}
-
-function buildGoogleOAuthStartUrl_(intent, acceptTerms) {
-  // Deprecated for cards — use buildGoogleSsoLaunchUrl_ (popup launcher).
-  return buildGoogleSsoLaunchUrl_(intent, acceptTerms);
-}
-
-/** Opens Workspace web app which starts Google SSO in a popup (not full-page). */
-function buildGoogleSsoLaunchUrl_(intent, acceptTerms) {
-  var web = getWebAppUrl_();
-  if (!web || String(web).indexOf("http") !== 0) return "";
-  var qs =
-    "sso=google" +
-    "&intent=" +
-    encodeURIComponent(intent === "signup" ? "signup" : "login");
-  if (intent === "signup") {
-    qs += "&acceptTerms=" + (acceptTerms ? "1" : "0");
-  }
-  return String(web).split("?")[0] + "?" + qs;
 }
 
 function buildSignedInSection_(session, prefetchedAuth) {
@@ -847,9 +1098,17 @@ function onCardGoogleSignIn_(e) {
       return notify_("Accept Terms & Conditions to sign up with Google.");
     }
   }
-  var url = buildGoogleSsoLaunchUrl_(isSignup ? "signup" : "login", true);
+  var url;
+  try {
+    url = getGoogleLoginUrl({
+      intent: isSignup ? "signup" : "login",
+      acceptTerms: true,
+    });
+  } catch (err) {
+    return notify_(String(err.message || err));
+  }
   if (!url) {
-    return notify_("Web app not deployed — cannot open Google sign-in.");
+    return notify_("Google sign-in URL is not configured.");
   }
   return CardService.newActionResponseBuilder()
     .setOpenLink(
@@ -962,9 +1221,10 @@ function onCardLogin_(e) {
     expiresAt: result.expiresAt || null,
   });
 
-  var nextCard = buildGmailMessageCard_(e);
   return CardService.newActionResponseBuilder()
-    .setNavigation(CardService.newNavigation().updateCard(nextCard))
+    .setNavigation(
+      CardService.newNavigation().updateCard(buildGmailMessageCard_(e))
+    )
     .setNotification(
       CardService.newNotification().setText(
         "Signed in as " + (result.email || email)
@@ -1181,18 +1441,20 @@ function runComposeEncryptAndSendCore_(e) {
     };
   }
 
-  var tokenRes = apiGmailSendToken_(gate.token);
+  var tokenRes = getMarketplaceGmailAccess_(gate.token);
   if (!tokenRes.ok || !tokenRes.accessToken) {
     return {
       ok: false,
+      needGmailConnect: true,
       error:
         tokenRes.error ||
-        "Allow Gmail once in the Chrome extension (read + send), then try again.",
+        "Connect Gmail once with your Google account, then try again.",
       code: tokenRes.code || "GMAIL_NOT_CONNECTED",
     };
   }
 
-  var payload = resolveComposeEncryptPayload_(e, tokenRes.accessToken);
+  var accessToken = tokenRes.accessToken;
+  var payload = resolveComposeEncryptPayload_(e, accessToken);
   if (!payload.firstTo) {
     return {
       ok: false,
@@ -1221,30 +1483,86 @@ function runComposeEncryptAndSendCore_(e) {
 
   var cipher = enc.messageCipherText || "";
   var meta = enc.mailMetadata || null;
-  var bodyHtml = buildSecureComposeBodyHtml_(cipher, meta, payload.firstTo);
-  var bodyText = buildSecureComposeBodyText_(cipher, meta, payload.firstTo);
+  var bodyHtml = buildSecureComposeBodyHtml_(cipher, meta);
+  var bodyText = buildSecureComposeBodyText_(cipher, meta);
   var toHeader = payload.toJoined || payload.firstTo;
   var subject = payload.subject || "Secure document";
+  var oldDraftId =
+    payload.matched && payload.matched.ok ? payload.matched.draftId || "" : "";
 
-  var sent = false;
-  var sendErr = "";
-  var sendRes = gmailMessagesSendWithToken_(tokenRes.accessToken, {
+  var mimeOpts = {
     from: tokenRes.from || "",
     to: toHeader,
+    cc:
+      payload.matched && payload.matched.ok
+        ? payload.matched.ccHeader || ""
+        : "",
+    bcc:
+      payload.matched && payload.matched.ok
+        ? payload.matched.bccHeader || ""
+        : "",
     subject: subject,
     html: bodyHtml,
     text: bodyText,
-  });
-  if (sendRes.ok) {
-    sent = true;
+  };
+
+  // 1) Create encrypted draft → 2) send → 3) delete plaintext draft
+  var flow = gmailCreateEncryptedDraftSendAndCleanup_(
+    oldDraftId,
+    mimeOpts,
+    accessToken
+  );
+
+  if (flow.ok && flow.sent) {
+    return {
+      ok: true,
+      sent: true,
+      sendError: "",
+      oldDraftDeleted: Boolean(flow.oldDeleted),
+      warning: flow.error || "",
+      firstTo: payload.firstTo,
+      subject: subject,
+      bodyHtml: bodyHtml,
+    };
+  }
+
+  // Fallback: messages.send, then delete old plaintext draft
+  var sendRes = gmailMessagesSendWithToken_(accessToken, mimeOpts);
+  if (!sendRes.ok) {
+    return {
+      ok: false,
+      error:
+        flow.sendError ||
+        flow.error ||
+        sendRes.error ||
+        "Send failed. Re-authorize the SecureDocShare add-on and try again.",
+    };
+  }
+
+  var oldDeleted = false;
+  var warning = "";
+  if (oldDraftId) {
+    var del = gmailDraftDelete_(oldDraftId, accessToken);
+    if (del.ok) {
+      oldDeleted = true;
+    } else {
+      warning =
+        "Encrypted mail sent, but the old plaintext draft could not be deleted. Discard the open compose window.";
+    }
   } else {
-    sendErr = sendRes.error || "Send failed.";
+    oldDeleted = true;
+  }
+
+  if (flow.newDraftId) {
+    gmailDraftDelete_(flow.newDraftId, accessToken);
   }
 
   return {
     ok: true,
-    sent: sent,
-    sendError: sendErr,
+    sent: true,
+    sendError: "",
+    oldDraftDeleted: oldDeleted,
+    warning: warning,
     firstTo: payload.firstTo,
     subject: subject,
     bodyHtml: bodyHtml,
@@ -1266,13 +1584,13 @@ function buildComposeDirectCard_(e) {
       CardService.newCardSection()
         .addWidget(
           CardService.newTextParagraph().setText(
-            "Encrypts this draft, replaces the compose body, and sends."
+            "Encrypts this draft, sends the encrypted mail, and deletes the plaintext draft. Gmail uses your SecureDocShare Google OAuth client (not the Chrome extension)."
           )
         )
         .addWidget(
           CardService.newButtonSet().addButton(
             CardService.newTextButton()
-              .setText("Encrypt & update compose")
+              .setText("Encrypt & send")
               .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
               .setOnClickAction(
                 CardService.newAction().setFunctionName(
@@ -1285,8 +1603,84 @@ function buildComposeDirectCard_(e) {
     .build();
 }
 
+function buildComposeSentCard_(result) {
+  result = result || {};
+  var lines = ["Encrypted mail sent successfully."];
+  if (result.oldDraftDeleted) {
+    lines.push("Plain text draft removed. Please close this compose window and open a new one to send another email.");
+  } else if (result.warning) {
+    lines.push(String(result.warning));
+  }
+
+  return CardService.newCardBuilder()
+    .setHeader(cardHeader_("SecureDocShare", "Sent"))
+    .addSection(
+      CardService.newCardSection()
+        .addWidget(CardService.newTextParagraph().setText(lines.join("\n")))
+        // .addWidget(
+        //   CardService.newButtonSet().addButton(
+        //     CardService.newTextButton()
+        //       .setText("Done")
+        //       .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+        //       .setOnClickAction(
+        //         CardService.newAction().setFunctionName("onComposeSentDone_")
+        //       )
+        //   )
+        // )
+    )
+    .build();
+}
+
+function onComposeSentDone_(e) {
+  return CardService.newActionResponseBuilder()
+    .setNavigation(
+      CardService.newNavigation().updateCard(buildMainCard_(e))
+    )
+    .build();
+}
+
+/** Open Google OAuth with YOUR web client — full window, asks all Gmail scopes. */
+function openMarketplaceGmailConnect_(e, message) {
+  var session = getWorkspaceSession_() || {};
+  if (!session.token) {
+    return notify_("Sign in to SecureDocShare first.");
+  }
+  var connect = apiGmailConnectUrl_(session.token);
+  if (!connect.ok || !connect.url) {
+    return notify_(
+      connect.error ||
+        "Could not start Gmail connect. Deploy the server with /auth/gmail/connect, then try again."
+    );
+  }
+  return CardService.newActionResponseBuilder()
+    .setNotification(
+      CardService.newNotification().setText(
+        "Opening Google — allow Gmail access, then tap Encrypt & send again."
+      )
+    )
+    .setOpenLink(
+      CardService.newOpenLink()
+        .setUrl(connect.url)
+        .setOpenAs(CardService.OpenAs.FULL_SIZE)
+        .setOnClose(CardService.OnClose.RELOAD)
+    )
+    .build();
+}
+
 function onComposeEncryptAndSend_(e) {
-  var result = runComposeEncryptAndSendCore_(e);
+  var result;
+  try {
+    result = runComposeEncryptAndSendCore_(e);
+  } catch (err) {
+    return CardService.newActionResponseBuilder()
+      .setNotification(
+        CardService.newNotification().setText(
+          "Encrypt/send error: " +
+            String(err && err.message ? err.message : err)
+        )
+      )
+      .build();
+  }
 
   if (result.needLogin) {
     return CardService.newActionResponseBuilder()
@@ -1301,7 +1695,20 @@ function onComposeEncryptAndSend_(e) {
       .build();
   }
 
+  if (result.needGmailConnect) {
+    return openMarketplaceGmailConnect_(e, result.error);
+  }
+
   if (!result.ok) {
+    // Fallback: any Gmail-not-connected style error should open Google prompt.
+    if (
+      result.code === "GMAIL_NOT_CONNECTED" ||
+      /Connect Gmail|Gmail not connected|GMAIL_NOT_CONNECTED/i.test(
+        String(result.error || "")
+      )
+    ) {
+      return openMarketplaceGmailConnect_(e, result.error);
+    }
     return CardService.newActionResponseBuilder()
       .setNotification(
         CardService.newNotification().setText(result.error || "Failed.")
@@ -1313,40 +1720,26 @@ function onComposeEncryptAndSend_(e) {
     return CardService.newActionResponseBuilder()
       .setNotification(
         CardService.newNotification().setText(
-          result.sendError ||
-            "Encrypted but send failed. Allow Gmail in the Chrome extension."
+          result.sendError || "Encrypted but send failed."
         )
       )
       .build();
   }
 
-  var updateBuilder = CardService.newUpdateDraftActionResponseBuilder()
-    .setUpdateDraftBodyAction(
-      CardService.newUpdateDraftBodyAction()
-        .addUpdateContent(
-          result.bodyHtml || "",
-          CardService.ContentType.MUTABLE_HTML
-        )
-        .setUpdateType(CardService.UpdateDraftBodyType.IN_PLACE_INSERT)
-    );
-
-  if (result.subject) {
-    updateBuilder.setUpdateDraftSubjectAction(
-      CardService.newUpdateDraftSubjectAction().addUpdateSubject(result.subject)
-    );
+  var note = "Encrypted mail sent.";
+  if (result.oldDraftDeleted) {
+    note += "";
+  } else if (result.warning) {
+    note += " " + result.warning;
   }
 
-  try {
-    if (result.firstTo) {
-      updateBuilder.setUpdateDraftToRecipientsAction(
-        CardService.newUpdateDraftToRecipientsAction().addUpdateToRecipients([
-          result.firstTo,
-        ])
-      );
-    }
-  } catch (eTo) {}
-
-  return updateBuilder.build();
+  return CardService.newActionResponseBuilder()
+    .setNotification(CardService.newNotification().setText(note))
+    .setStateChanged(true)
+    .setNavigation(
+      CardService.newNavigation().updateCard(buildComposeSentCard_(result))
+    )
+    .build();
 }
 
 function buildSecureComposeBodyHtml_(cipher, meta) {
@@ -1569,6 +1962,59 @@ function apiOAuthComplete_(ticket) {
   }
 }
 
+/**
+ * Apps Script Google OAuth → SecureDocShare session (id_token verified on server).
+ * Stores gmailRefreshToken in DB when Google returns offline access.
+ */
+function apiLoginGoogle_(opts) {
+  opts = opts || {};
+  try {
+    var body = {
+      idToken: String(opts.idToken || ""),
+      intent: opts.intent === "signup" ? "signup" : "login",
+      acceptTerms: Boolean(opts.acceptTerms),
+    };
+    if (opts.gmailRefreshToken) {
+      body.gmailRefreshToken = String(opts.gmailRefreshToken);
+    }
+    if (opts.gmailScopes) {
+      body.gmailScopes = String(opts.gmailScopes);
+    }
+    var res = UrlFetchApp.fetch(API_BASE + "/auth/login/google", {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(body),
+      muteHttpExceptions: true,
+    });
+    var code = res.getResponseCode();
+    var data = {};
+    try {
+      data = JSON.parse(res.getContentText() || "{}");
+    } catch (err) {}
+    if (code < 200 || code >= 300) {
+      return {
+        ok: false,
+        error: data.error || "Google login failed (" + code + ")",
+        code: data.code || "",
+      };
+    }
+    var token = data.token || data.accessToken;
+    if (!token) {
+      return { ok: false, error: "No session token from server." };
+    }
+    return {
+      ok: true,
+      token: token,
+      email: data.email || "",
+      expiresAt: data.expiresAt || null,
+      refreshToken: data.refreshToken || null,
+      gmailConnected: data.gmailConnected === true,
+    };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
 function apiGetSubscription_(token) {
   try {
     var res = UrlFetchApp.fetch(API_BASE + "/auth/subscription", {
@@ -1627,14 +2073,65 @@ function apiEncrypt_(to, subject, message, token) {
   }
 }
 
-/** Short-lived Gmail access token (extension-connected gmail.send). */
-function apiGmailSendToken_(token) {
+/**
+ * Gmail access via YOUR OAuth client (GOOGLE_GMAIL_CLIENT_ID on the server).
+ * Not Apps Script's default GCP project — avoids "Gmail API disabled on project …".
+ */
+function getMarketplaceGmailAccess_(secureDocToken) {
   try {
+    if (!secureDocToken) {
+      return {
+        ok: false,
+        code: "LOGIN_REQUIRED",
+        error: "Sign in to SecureDocShare first.",
+      };
+    }
     var res = UrlFetchApp.fetch(API_BASE + "/auth/gmail/send-token", {
       method: "post",
       contentType: "application/json",
-      headers: { Authorization: "Bearer " + token },
+      headers: { Authorization: "Bearer " + secureDocToken },
       payload: "{}",
+      muteHttpExceptions: true,
+    });
+    var code = res.getResponseCode();
+    var data = {};
+    try {
+      data = JSON.parse(res.getContentText() || "{}");
+    } catch (e) {}
+    if (code < 200 || code >= 300) {
+      var err = data.error || "Gmail send-token failed (" + code + ")";
+      if (data.code === "GMAIL_NOT_CONNECTED" || code === 403) {
+        return {
+          ok: false,
+          code: "GMAIL_NOT_CONNECTED",
+          error:
+            "Connect Gmail once with your Google account (SecureDocShare), then try Encrypt & send again.",
+        };
+      }
+      return { ok: false, code: data.code || "", error: err };
+    }
+    return {
+      ok: true,
+      accessToken: data.accessToken || "",
+      from: data.from || "",
+      appUrl: data.appUrl || "",
+      scope: data.scope || "",
+      hasCompose: data.hasCompose === true,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: String(err && err.message ? err.message : err),
+    };
+  }
+}
+
+/** Start Gmail OAuth with YOUR web client (server /gmail/connect → /gmail/go). */
+function apiGmailConnectUrl_(secureDocToken) {
+  try {
+    var res = UrlFetchApp.fetch(API_BASE + "/auth/gmail/connect", {
+      method: "get",
+      headers: { Authorization: "Bearer " + secureDocToken },
       muteHttpExceptions: true,
     });
     var code = res.getResponseCode();
@@ -1645,19 +2142,24 @@ function apiGmailSendToken_(token) {
     if (code < 200 || code >= 300) {
       return {
         ok: false,
-        code: data.code || "",
-        error: data.error || "Gmail send-token failed (" + code + ")",
+        error: data.error || "Could not start Gmail connect (" + code + ")",
       };
     }
-    return {
-      ok: true,
-      accessToken: data.accessToken || "",
-      from: data.from || "",
-      appUrl: data.appUrl || "",
-    };
+    // Prefer same-origin /gmail/go (add-on OpenLink), then Google URL.
+    var openUrl = data.goUrl || data.url || "";
+    if (!openUrl) {
+      return { ok: false, error: "Gmail connect URL missing from server." };
+    }
+    return { ok: true, url: openUrl, googleUrl: data.url || "" };
   } catch (err) {
     return { ok: false, error: String(err) };
   }
+}
+
+/** HtmlService: token for Encrypt and send. */
+function getMarketplaceGmailSendToken() {
+  var session = getWorkspaceSession_() || {};
+  return getMarketplaceGmailAccess_(session.token);
 }
 
 function apiDecrypt_(options) {
@@ -1752,7 +2254,7 @@ function getWorkspaceOAuthToken() {
 }
 
 /**
- * Search Contacts + Other contacts (same endpoints as Chrome extension).
+ * Search Contacts + Other contacts (People API via marketplace OAuth).
  * @param {string} query
  * @returns {{ok:boolean, results:Array<{email:string,name:string}>, error?:string, code?:string}}
  */
@@ -1929,7 +2431,8 @@ function gmailApiRequest_(method, path, body, accessToken) {
       return {
         ok: false,
         code: 401,
-        error: "Gmail access token missing. Allow Gmail in the Chrome extension.",
+        error:
+          "Gmail access token missing. Re-authorize the SecureDocShare add-on.",
       };
     }
     const options = {
@@ -2088,7 +2591,7 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
   );
   if (!list.ok) {
     const scopeHint = /insufficient|scope/i.test(String(list.error || ""))
-      ? " Re-Allow Gmail in the Chrome extension (needs mail read + send)."
+      ? " Re-authorize the SecureDocShare add-on (needs Gmail modify access)."
       : "";
     return {
       ok: false,
@@ -2213,6 +2716,113 @@ function encodeRawMime_(rfc822) {
     /=+$/,
     ""
   );
+}
+
+/** Create a draft with recipient, subject, and encrypted body. */
+function gmailDraftCreate_(options, accessToken) {
+  const rfc822 = buildRfc822EncryptedMime_(options);
+  const raw = encodeRawMime_(rfc822);
+  return gmailApiRequest_(
+    "post",
+    "/gmail/v1/users/me/drafts",
+    { message: { raw: raw } },
+    accessToken
+  );
+}
+
+/** Send a draft (Gmail removes that draft after send). */
+function gmailDraftSend_(draftId, accessToken) {
+  if (!draftId) {
+    return { ok: false, error: "Draft id missing." };
+  }
+  return gmailApiRequest_(
+    "post",
+    "/gmail/v1/users/me/drafts/send",
+    { id: draftId },
+    accessToken
+  );
+}
+
+/** Delete a draft (used for the old plaintext compose). */
+function gmailDraftDelete_(draftId, accessToken) {
+  if (!draftId) {
+    return { ok: false, error: "Draft id missing." };
+  }
+  return gmailApiRequest_(
+    "delete",
+    "/gmail/v1/users/me/drafts/" + encodeURIComponent(draftId),
+    null,
+    accessToken
+  );
+}
+
+/**
+ * Create encrypted draft → send it → delete old plaintext draft.
+ * Returns { ok, newDraftId, sent, oldDeleted, error, sendError }.
+ */
+function gmailCreateEncryptedDraftSendAndCleanup_(
+  oldDraftId,
+  mimeOpts,
+  accessToken
+) {
+  const created = gmailDraftCreate_(mimeOpts, accessToken);
+  if (!created.ok || !created.data) {
+    return {
+      ok: false,
+      newDraftId: "",
+      sent: false,
+      oldDeleted: false,
+      error: created.error || "Could not create encrypted draft.",
+      sendError: "",
+    };
+  }
+
+  const newDraftId = (created.data && created.data.id) || "";
+  if (!newDraftId) {
+    return {
+      ok: false,
+      newDraftId: "",
+      sent: false,
+      oldDeleted: false,
+      error: "Encrypted draft created but id missing.",
+      sendError: "",
+    };
+  }
+
+  const sentRes = gmailDraftSend_(newDraftId, accessToken);
+  if (!sentRes.ok) {
+    // Leave the encrypted draft for the user; do not delete plaintext yet.
+    return {
+      ok: false,
+      newDraftId: newDraftId,
+      sent: false,
+      oldDeleted: false,
+      error: "",
+      sendError: sentRes.error || "Could not send encrypted draft.",
+    };
+  }
+
+  let oldDeleted = false;
+  let deleteError = "";
+  if (oldDraftId && oldDraftId !== newDraftId) {
+    const del = gmailDraftDelete_(oldDraftId, accessToken);
+    if (del.ok) {
+      oldDeleted = true;
+    } else {
+      deleteError = del.error || "Could not delete the old plaintext draft.";
+    }
+  } else {
+    oldDeleted = true;
+  }
+
+  return {
+    ok: true,
+    newDraftId: newDraftId,
+    sent: true,
+    oldDeleted: oldDeleted,
+    error: deleteError,
+    sendError: "",
+  };
 }
 
 function gmailMessagesSendWithToken_(accessToken, options) {

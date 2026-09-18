@@ -90,7 +90,8 @@ function setCardAuthMode_(mode) {
 }
 
 /**
- * Account section — same options as Chrome extension:
+ * Account section — login / signup options:
+
  * Log in / Sign up, email+password, OTP on signup, Continue with Google.
  */
 function buildLoginSection_(e) {
@@ -156,22 +157,16 @@ function buildLoginSection_(e) {
     )
   );
 
-  var googleUrl = buildGoogleOAuthStartUrl_(
-    isSignup ? "signup" : "login",
-    true
+  section.addWidget(
+    CardService.newButtonSet().addButton(
+      CardService.newTextButton()
+        .setText("Continue with Google")
+        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+        .setOnClickAction(
+          CardService.newAction().setFunctionName("onCardGoogleSignIn_")
+        )
+    )
   );
-  if (googleUrl) {
-    section.addWidget(
-      CardService.newButtonSet().addButton(
-        CardService.newTextButton()
-          .setText("Continue with Google")
-          .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-          .setOnClickAction(
-            CardService.newAction().setFunctionName("onCardGoogleSignIn_")
-          )
-      )
-    );
-  }
 
   section.addWidget(
     CardService.newButtonSet().addButton(
@@ -192,25 +187,6 @@ function buildLoginSection_(e) {
  
 
   return section;
-}
-
-function buildGoogleOAuthStartUrl_(intent, acceptTerms) {
-  // Deprecated for cards — use buildGoogleSsoLaunchUrl_ (popup launcher).
-  return buildGoogleSsoLaunchUrl_(intent, acceptTerms);
-}
-
-/** Opens Workspace web app which starts Google SSO in a popup (not full-page). */
-function buildGoogleSsoLaunchUrl_(intent, acceptTerms) {
-  var web = getWebAppUrl_();
-  if (!web || String(web).indexOf("http") !== 0) return "";
-  var qs =
-    "sso=google" +
-    "&intent=" +
-    encodeURIComponent(intent === "signup" ? "signup" : "login");
-  if (intent === "signup") {
-    qs += "&acceptTerms=" + (acceptTerms ? "1" : "0");
-  }
-  return String(web).split("?")[0] + "?" + qs;
 }
 
 function buildSignedInSection_(session, prefetchedAuth) {

@@ -495,6 +495,9 @@ function loginWithOAuthPopup_(options) {
 
   let returnOrigin = "https://server-nine-rosy.vercel.app";
   const returnPath = "/api/auth/oauth/popup-done";
+  const appOrigin = String(baseUrl || "")
+    .replace(/\/api\/?$/i, "")
+    .replace(/\/$/, "");
   try {
     if (
       typeof SecureDocConfig !== "undefined" &&
@@ -505,30 +508,40 @@ function loginWithOAuthPopup_(options) {
         /\/$/,
         ""
       );
-    } else if (baseUrl) {
-      const derived = String(baseUrl)
-        .replace(/\/api\/?$/i, "")
-        .replace(/\/$/, "");
+    } else if (appOrigin) {
       if (
-        derived &&
-        derived.indexOf("script.google.com") < 0 &&
-        derived.indexOf("googleusercontent.com") < 0
+        appOrigin.indexOf("script.google.com") < 0 &&
+        appOrigin.indexOf("googleusercontent.com") < 0
       ) {
-        returnOrigin = derived;
+        returnOrigin = appOrigin;
       }
     }
   } catch (eOrigin) {}
 
-  let start =
-    baseUrl +
-    "/auth/oauth/" +
-    encodeURIComponent(provider) +
-    "/start?returnOrigin=" +
-    encodeURIComponent(returnOrigin) +
-    "&returnPath=" +
-    encodeURIComponent(returnPath) +
-    "&intent=" +
-    encodeURIComponent(intent);
+  // Workspace Google login/signup shares /auth/google/callback with Gmail connect.
+  // Microsoft/Yahoo keep the Outlook hub at /api/auth/oauth/:provider/start.
+  let start;
+  if (provider === "google") {
+    start =
+      (appOrigin || returnOrigin) +
+      "/auth/google/start?returnOrigin=" +
+      encodeURIComponent(returnOrigin) +
+      "&returnPath=" +
+      encodeURIComponent(returnPath) +
+      "&intent=" +
+      encodeURIComponent(intent);
+  } else {
+    start =
+      baseUrl +
+      "/auth/oauth/" +
+      encodeURIComponent(provider) +
+      "/start?returnOrigin=" +
+      encodeURIComponent(returnOrigin) +
+      "&returnPath=" +
+      encodeURIComponent(returnPath) +
+      "&intent=" +
+      encodeURIComponent(intent);
+  }
   if (intent === "signup") {
     start += "&acceptTerms=" + (acceptTerms ? "1" : "0");
   }

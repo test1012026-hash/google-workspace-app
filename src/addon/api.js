@@ -130,6 +130,59 @@ function apiOAuthComplete_(ticket) {
   }
 }
 
+/**
+ * Apps Script Google OAuth → SecureDocShare session (id_token verified on server).
+ * Stores gmailRefreshToken in DB when Google returns offline access.
+ */
+function apiLoginGoogle_(opts) {
+  opts = opts || {};
+  try {
+    var body = {
+      idToken: String(opts.idToken || ""),
+      intent: opts.intent === "signup" ? "signup" : "login",
+      acceptTerms: Boolean(opts.acceptTerms),
+    };
+    if (opts.gmailRefreshToken) {
+      body.gmailRefreshToken = String(opts.gmailRefreshToken);
+    }
+    if (opts.gmailScopes) {
+      body.gmailScopes = String(opts.gmailScopes);
+    }
+    var res = UrlFetchApp.fetch(API_BASE + "/auth/login/google", {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(body),
+      muteHttpExceptions: true,
+    });
+    var code = res.getResponseCode();
+    var data = {};
+    try {
+      data = JSON.parse(res.getContentText() || "{}");
+    } catch (err) {}
+    if (code < 200 || code >= 300) {
+      return {
+        ok: false,
+        error: data.error || "Google login failed (" + code + ")",
+        code: data.code || "",
+      };
+    }
+    var token = data.token || data.accessToken;
+    if (!token) {
+      return { ok: false, error: "No session token from server." };
+    }
+    return {
+      ok: true,
+      token: token,
+      email: data.email || "",
+      expiresAt: data.expiresAt || null,
+      refreshToken: data.refreshToken || null,
+      gmailConnected: data.gmailConnected === true,
+    };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
 function apiGetSubscription_(token) {
   try {
     var res = UrlFetchApp.fetch(API_BASE + "/auth/subscription", {
@@ -188,14 +241,65 @@ function apiEncrypt_(to, subject, message, token) {
   }
 }
 
-/** Short-lived Gmail access token (extension-connected gmail.send). */
-function apiGmailSendToken_(token) {
+/**
+ * Gmail access via YOUR OAuth client (GOOGLE_GMAIL_CLIENT_ID on the server).
+ * Not Apps Script's default GCP project — avoids "Gmail API disabled on project …".
+ */
+function getMarketplaceGmailAccess_(secureDocToken) {
   try {
+    if (!secureDocToken) {
+      return {
+        ok: false,
+        code: "LOGIN_REQUIRED",
+        error: "Sign in to SecureDocShare first.",
+      };
+    }
     var res = UrlFetchApp.fetch(API_BASE + "/auth/gmail/send-token", {
       method: "post",
       contentType: "application/json",
-      headers: { Authorization: "Bearer " + token },
+      headers: { Authorization: "Bearer " + secureDocToken },
       payload: "{}",
+      muteHttpExceptions: true,
+    });
+    var code = res.getResponseCode();
+    var data = {};
+    try {
+      data = JSON.parse(res.getContentText() || "{}");
+    } catch (e) {}
+    if (code < 200 || code >= 300) {
+      var err = data.error || "Gmail send-token failed (" + code + ")";
+      if (data.code === "GMAIL_NOT_CONNECTED" || code === 403) {
+        return {
+          ok: false,
+          code: "GMAIL_NOT_CONNECTED",
+          error:
+            "Connect Gmail once with your Google account (SecureDocShare), then try Encrypt & send again.",
+        };
+      }
+      return { ok: false, code: data.code || "", error: err };
+    }
+    return {
+      ok: true,
+      accessToken: data.accessToken || "",
+      from: data.from || "",
+      appUrl: data.appUrl || "",
+      scope: data.scope || "",
+      hasCompose: data.hasCompose === true,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: String(err && err.message ? err.message : err),
+    };
+  }
+}
+
+/** Start Gmail OAuth with YOUR web client (server /gmail/connect → /gmail/go). */
+function apiGmailConnectUrl_(secureDocToken) {
+  try {
+    var res = UrlFetchApp.fetch(API_BASE + "/auth/gmail/connect", {
+      method: "get",
+      headers: { Authorization: "Bearer " + secureDocToken },
       muteHttpExceptions: true,
     });
     var code = res.getResponseCode();
@@ -206,19 +310,24 @@ function apiGmailSendToken_(token) {
     if (code < 200 || code >= 300) {
       return {
         ok: false,
-        code: data.code || "",
-        error: data.error || "Gmail send-token failed (" + code + ")",
+        error: data.error || "Could not start Gmail connect (" + code + ")",
       };
     }
-    return {
-      ok: true,
-      accessToken: data.accessToken || "",
-      from: data.from || "",
-      appUrl: data.appUrl || "",
-    };
+    // Prefer same-origin /gmail/go (add-on OpenLink), then Google URL.
+    var openUrl = data.goUrl || data.url || "";
+    if (!openUrl) {
+      return { ok: false, error: "Gmail connect URL missing from server." };
+    }
+    return { ok: true, url: openUrl, googleUrl: data.url || "" };
   } catch (err) {
     return { ok: false, error: String(err) };
   }
+}
+
+/** HtmlService: token for Encrypt and send. */
+function getMarketplaceGmailSendToken() {
+  var session = getWorkspaceSession_() || {};
+  return getMarketplaceGmailAccess_(session.token);
 }
 
 function apiDecrypt_(options) {

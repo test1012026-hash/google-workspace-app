@@ -24,7 +24,7 @@
     var appUrl = options.appUrl
       ? String(options.appUrl).replace(/\/$/, "")
       : null;
-    var openUrl = appUrl ? appUrl + "/open-extension" : null;
+    var openUrl = null;
     var meta = options.mailMetadata || null;
     var metaText = [
       meta && meta.token ? "Metadata" : "",
@@ -217,7 +217,7 @@
       return res.text().then(function (errBody) {
         if (res.status === 401 || res.status === 403) {
           var err = new Error(
-            "Gmail access expired. Allow Gmail once from the Chrome extension, then try again.",
+            "Gmail access expired. Re-authorize the SecureDocShare add-on, then try again.",
           );
           err.code = "GMAIL_NOT_CONNECTED";
           throw err;

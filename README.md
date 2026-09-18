@@ -48,4 +48,9 @@ npm run build
 2. Re-authorize Contacts scopes; enable People API if needed
 3. Deploy Web app + test deployments
 
-Gmail send needs a one-time Allow Gmail from the Chrome extension (refresh token).
+Gmail send uses **your** `GOOGLE_GMAIL_CLIENT_ID` / secret on the server (`/auth/gmail/send-token`).  
+It does **not** use Apps Script’s default GCP project (`ScriptApp.getOAuthToken`).
+
+- **Continue with Google** in the add-on stores a Gmail refresh token (offline + compose scopes).
+- If missing, Encrypt & send opens `/auth/gmail/connect` (same web OAuth client).
+- Enable **Gmail API** on the GCP project that owns `GOOGLE_GMAIL_CLIENT_ID` (not the Apps Script default project).

@@ -5,7 +5,8 @@ function gmailApiRequest_(method, path, body, accessToken) {
       return {
         ok: false,
         code: 401,
-        error: "Gmail access token missing. Allow Gmail in the Chrome extension.",
+        error:
+          "Gmail access token missing. Re-authorize the SecureDocShare add-on.",
       };
     }
     const options = {
@@ -164,7 +165,7 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
   );
   if (!list.ok) {
     const scopeHint = /insufficient|scope/i.test(String(list.error || ""))
-      ? " Re-Allow Gmail in the Chrome extension (needs mail read + send)."
+      ? " Re-authorize the SecureDocShare add-on (needs Gmail modify access)."
       : "";
     return {
       ok: false,
@@ -289,6 +290,113 @@ function encodeRawMime_(rfc822) {
     /=+$/,
     ""
   );
+}
+
+/** Create a draft with recipient, subject, and encrypted body. */
+function gmailDraftCreate_(options, accessToken) {
+  const rfc822 = buildRfc822EncryptedMime_(options);
+  const raw = encodeRawMime_(rfc822);
+  return gmailApiRequest_(
+    "post",
+    "/gmail/v1/users/me/drafts",
+    { message: { raw: raw } },
+    accessToken
+  );
+}
+
+/** Send a draft (Gmail removes that draft after send). */
+function gmailDraftSend_(draftId, accessToken) {
+  if (!draftId) {
+    return { ok: false, error: "Draft id missing." };
+  }
+  return gmailApiRequest_(
+    "post",
+    "/gmail/v1/users/me/drafts/send",
+    { id: draftId },
+    accessToken
+  );
+}
+
+/** Delete a draft (used for the old plaintext compose). */
+function gmailDraftDelete_(draftId, accessToken) {
+  if (!draftId) {
+    return { ok: false, error: "Draft id missing." };
+  }
+  return gmailApiRequest_(
+    "delete",
+    "/gmail/v1/users/me/drafts/" + encodeURIComponent(draftId),
+    null,
+    accessToken
+  );
+}
+
+/**
+ * Create encrypted draft → send it → delete old plaintext draft.
+ * Returns { ok, newDraftId, sent, oldDeleted, error, sendError }.
+ */
+function gmailCreateEncryptedDraftSendAndCleanup_(
+  oldDraftId,
+  mimeOpts,
+  accessToken
+) {
+  const created = gmailDraftCreate_(mimeOpts, accessToken);
+  if (!created.ok || !created.data) {
+    return {
+      ok: false,
+      newDraftId: "",
+      sent: false,
+      oldDeleted: false,
+      error: created.error || "Could not create encrypted draft.",
+      sendError: "",
+    };
+  }
+
+  const newDraftId = (created.data && created.data.id) || "";
+  if (!newDraftId) {
+    return {
+      ok: false,
+      newDraftId: "",
+      sent: false,
+      oldDeleted: false,
+      error: "Encrypted draft created but id missing.",
+      sendError: "",
+    };
+  }
+
+  const sentRes = gmailDraftSend_(newDraftId, accessToken);
+  if (!sentRes.ok) {
+    // Leave the encrypted draft for the user; do not delete plaintext yet.
+    return {
+      ok: false,
+      newDraftId: newDraftId,
+      sent: false,
+      oldDeleted: false,
+      error: "",
+      sendError: sentRes.error || "Could not send encrypted draft.",
+    };
+  }
+
+  let oldDeleted = false;
+  let deleteError = "";
+  if (oldDraftId && oldDraftId !== newDraftId) {
+    const del = gmailDraftDelete_(oldDraftId, accessToken);
+    if (del.ok) {
+      oldDeleted = true;
+    } else {
+      deleteError = del.error || "Could not delete the old plaintext draft.";
+    }
+  } else {
+    oldDeleted = true;
+  }
+
+  return {
+    ok: true,
+    newDraftId: newDraftId,
+    sent: true,
+    oldDeleted: oldDeleted,
+    error: deleteError,
+    sendError: "",
+  };
 }
 
 function gmailMessagesSendWithToken_(accessToken, options) {

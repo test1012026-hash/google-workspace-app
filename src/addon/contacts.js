@@ -4,7 +4,7 @@ function getWorkspaceOAuthToken() {
 }
 
 /**
- * Search Contacts + Other contacts (same endpoints as Chrome extension).
+ * Search Contacts + Other contacts (People API via marketplace OAuth).
  * @param {string} query
  * @returns {{ok:boolean, results:Array<{email:string,name:string}>, error?:string, code?:string}}
  */

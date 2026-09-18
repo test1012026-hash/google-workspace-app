@@ -304,7 +304,7 @@ function handleOAuthTicketQuery_() {
   return true;
 }
 
-/** Card "Continue with Google" opens ?sso=google → start popup here. */
+/** Card "Continue with Google" legacy ?sso=google → Apps Script OAuth URL. */
 function handleSsoLaunchQuery_() {
   var params;
   try {
@@ -318,56 +318,41 @@ function handleSsoLaunchQuery_() {
   var acceptTerms =
     params.get("acceptTerms") === "1" || params.get("acceptTerms") === "true";
 
-  if (intent === "signup") {
-    setAuthMode("signup");
-    var termsBox = document.getElementById("accept-terms");
-    if (termsBox) termsBox.checked = true;
+  if (
+    typeof google === "undefined" ||
+    !google.script ||
+    !google.script.run ||
+    typeof google.script.run.getGoogleLoginUrl !== "function"
+  ) {
+    setLoginError("Google sign-in is only available inside the Workspace app.");
+    return;
   }
 
   var gate = document.getElementById("auth-gate-hint");
   if (gate) {
     gate.style.display = "block";
-    gate.textContent = "Opening Google sign-in popup…";
+    gate.textContent = "Opening Google sign-in…";
   }
-  setLoginError("");
   setSsoBusy(true);
 
-  if (typeof loginWithOAuth !== "function") {
-    setSsoBusy(false);
-    setLoginError("OAuth helper not loaded.");
-    return;
-  }
-
-  loginWithOAuth({
-    provider: "google",
-    intent: intent,
-    acceptTerms: intent === "signup" ? true : acceptTerms,
-    apiBaseUrl: apiBase(),
-  })
-    .then(function (res) {
+  google.script.run
+    .withSuccessHandler(function (url) {
       setSsoBusy(false);
-      if (!res || !res.ok) {
-        setLoginError((res && res.error) || "Google sign-in failed");
-        if (gate) gate.textContent = "Sign in above to use Encrypt and Decrypt.";
+      if (!url) {
+        setLoginError("Could not start Google sign-in.");
         return;
       }
-      if (gate) {
-        gate.textContent =
-          "Signed in. Close this window — the Gmail add-on will reload.";
-      }
-      refreshAuthState(function () {});
       try {
-        // Clean query so refresh does not re-open Google.
-        if (window.history && window.history.replaceState) {
-          window.history.replaceState({}, "", location.pathname);
-        }
-      } catch (e2) {}
+        window.top.location.href = url;
+      } catch (e2) {
+        window.location.href = url;
+      }
     })
-    .catch(function (err) {
+    .withFailureHandler(function (err) {
       setSsoBusy(false);
-      setLoginError(err.message || String(err));
-      if (gate) gate.textContent = "Sign in above to use Encrypt and Decrypt.";
-    });
+      setLoginError((err && err.message) || String(err));
+    })
+    .getGoogleLoginUrl({ intent: intent, acceptTerms: acceptTerms || intent === "signup" });
 }
 
 function setAuthMode(next) {
@@ -504,11 +489,8 @@ function setSsoBusy(busy) {
 function onSsoClick(ev) {
   var btn = ev.currentTarget;
   var provider = btn && btn.getAttribute("data-provider");
-  if (!provider) return;
-  if (typeof loginWithOAuth !== "function") {
-    setLoginError("OAuth helper not loaded.");
-    return;
-  }
+  if (!provider || provider !== "google") return;
+
   var isSignup = _authMode === "signup";
   var termsBox = document.getElementById("accept-terms");
   if (isSignup && (!termsBox || !termsBox.checked)) {
@@ -517,24 +499,40 @@ function onSsoClick(ev) {
   }
   setLoginError("");
   setSsoBusy(true);
-  loginWithOAuth({
-    provider: provider,
-    intent: isSignup ? "signup" : "login",
-    acceptTerms: isSignup,
-    apiBaseUrl: apiBase(),
-  })
-    .then(function (res) {
-      setSsoBusy(false);
-      if (!res || !res.ok) {
-        setLoginError((res && res.error) || "SSO failed");
-        return;
-      }
-      refreshAuthState(function () {});
-    })
-    .catch(function (err) {
-      setSsoBusy(false);
-      setLoginError(err.message || String(err));
-    });
+
+  // Apps Script OAuth2 (OpenID) — not browser-trusted email.
+  if (
+    typeof google !== "undefined" &&
+    google.script &&
+    google.script.run &&
+    typeof google.script.run.getGoogleLoginUrl === "function"
+  ) {
+    google.script.run
+      .withSuccessHandler(function (url) {
+        setSsoBusy(false);
+        if (!url) {
+          setLoginError("Could not start Google sign-in.");
+          return;
+        }
+        try {
+          window.top.location.href = url;
+        } catch (e) {
+          window.location.href = url;
+        }
+      })
+      .withFailureHandler(function (err) {
+        setSsoBusy(false);
+        setLoginError((err && err.message) || String(err) || "Google sign-in failed");
+      })
+      .getGoogleLoginUrl({
+        intent: isSignup ? "signup" : "login",
+        acceptTerms: isSignup,
+      });
+    return;
+  }
+
+  setSsoBusy(false);
+  setLoginError("Google sign-in is only available inside the Workspace app.");
 }
 
 function setLoginError(msg) {
@@ -1193,24 +1191,48 @@ function ensureSendToken_() {
     return Promise.resolve(_gmailSendTokenCache);
   }
   setComposeStatus("Requesting Gmail send token…");
-  return apiJson("/auth/gmail/send-token", {
-    method: "POST",
-    token: _sessionToken,
-    body: {},
-  }).then(function (tokenOut) {
-    var tokenRes = tokenOut.res;
-    var tokenData = tokenOut.data || {};
-    if (!tokenRes.ok) {
-      throw new Error(
-        (tokenData.error || "Gmail not connected.") +
-          " Allow Gmail once in the Chrome extension, then Encrypt and send again."
-      );
-    }
-    _gmailSendTokenCache = {
-      accessToken: tokenData.accessToken,
-      from: tokenData.from || _sessionEmail,
-      appUrl: tokenData.appUrl || "",
-    };
+
+  function fromMarketplace() {
+    return new Promise(function (resolve, reject) {
+      if (
+        typeof google === "undefined" ||
+        !google.script ||
+        !google.script.run
+      ) {
+        reject(new Error("Apps Script runtime unavailable."));
+        return;
+      }
+      google.script.run
+        .withSuccessHandler(function (data) {
+          if (!data || !data.ok || !data.accessToken) {
+            reject(
+              new Error(
+                (data && data.error) ||
+                  "Connect Gmail once (SecureDocShare Google account), then try again."
+              )
+            );
+            return;
+          }
+          resolve({
+            accessToken: data.accessToken,
+            from: data.from || _sessionEmail,
+            appUrl: data.appUrl || "",
+          });
+        })
+        .withFailureHandler(function (err) {
+          reject(
+            new Error(
+              (err && err.message) ||
+                "Could not get Gmail token from SecureDocShare."
+            )
+          );
+        })
+        .getMarketplaceGmailSendToken();
+    });
+  }
+
+  return fromMarketplace().then(function (tokenData) {
+    _gmailSendTokenCache = tokenData;
     return _gmailSendTokenCache;
   });
 }

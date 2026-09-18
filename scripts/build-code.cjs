@@ -10,6 +10,7 @@ const addonDir = path.join(root, "src", "addon");
 
 const MODULES = [
   "config.js",
+  "google-oauth.js",
   "ui.js",
   "cards.js",
   "actions.js",

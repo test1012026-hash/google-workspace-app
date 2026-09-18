@@ -21,9 +21,17 @@ function onCardGoogleSignIn_(e) {
       return notify_("Accept Terms & Conditions to sign up with Google.");
     }
   }
-  var url = buildGoogleSsoLaunchUrl_(isSignup ? "signup" : "login", true);
+  var url;
+  try {
+    url = getGoogleLoginUrl({
+      intent: isSignup ? "signup" : "login",
+      acceptTerms: true,
+    });
+  } catch (err) {
+    return notify_(String(err.message || err));
+  }
   if (!url) {
-    return notify_("Web app not deployed — cannot open Google sign-in.");
+    return notify_("Google sign-in URL is not configured.");
   }
   return CardService.newActionResponseBuilder()
     .setOpenLink(
@@ -136,9 +144,10 @@ function onCardLogin_(e) {
     expiresAt: result.expiresAt || null,
   });
 
-  var nextCard = buildGmailMessageCard_(e);
   return CardService.newActionResponseBuilder()
-    .setNavigation(CardService.newNavigation().updateCard(nextCard))
+    .setNavigation(
+      CardService.newNavigation().updateCard(buildGmailMessageCard_(e))
+    )
     .setNotification(
       CardService.newNotification().setText(
         "Signed in as " + (result.email || email)
@@ -355,18 +364,20 @@ function runComposeEncryptAndSendCore_(e) {
     };
   }
 
-  var tokenRes = apiGmailSendToken_(gate.token);
+  var tokenRes = getMarketplaceGmailAccess_(gate.token);
   if (!tokenRes.ok || !tokenRes.accessToken) {
     return {
       ok: false,
+      needGmailConnect: true,
       error:
         tokenRes.error ||
-        "Allow Gmail once in the Chrome extension (read + send), then try again.",
+        "Connect Gmail once with your Google account, then try again.",
       code: tokenRes.code || "GMAIL_NOT_CONNECTED",
     };
   }
 
-  var payload = resolveComposeEncryptPayload_(e, tokenRes.accessToken);
+  var accessToken = tokenRes.accessToken;
+  var payload = resolveComposeEncryptPayload_(e, accessToken);
   if (!payload.firstTo) {
     return {
       ok: false,
@@ -395,30 +406,86 @@ function runComposeEncryptAndSendCore_(e) {
 
   var cipher = enc.messageCipherText || "";
   var meta = enc.mailMetadata || null;
-  var bodyHtml = buildSecureComposeBodyHtml_(cipher, meta, payload.firstTo);
-  var bodyText = buildSecureComposeBodyText_(cipher, meta, payload.firstTo);
+  var bodyHtml = buildSecureComposeBodyHtml_(cipher, meta);
+  var bodyText = buildSecureComposeBodyText_(cipher, meta);
   var toHeader = payload.toJoined || payload.firstTo;
   var subject = payload.subject || "Secure document";
+  var oldDraftId =
+    payload.matched && payload.matched.ok ? payload.matched.draftId || "" : "";
 
-  var sent = false;
-  var sendErr = "";
-  var sendRes = gmailMessagesSendWithToken_(tokenRes.accessToken, {
+  var mimeOpts = {
     from: tokenRes.from || "",
     to: toHeader,
+    cc:
+      payload.matched && payload.matched.ok
+        ? payload.matched.ccHeader || ""
+        : "",
+    bcc:
+      payload.matched && payload.matched.ok
+        ? payload.matched.bccHeader || ""
+        : "",
     subject: subject,
     html: bodyHtml,
     text: bodyText,
-  });
-  if (sendRes.ok) {
-    sent = true;
+  };
+
+  // 1) Create encrypted draft → 2) send → 3) delete plaintext draft
+  var flow = gmailCreateEncryptedDraftSendAndCleanup_(
+    oldDraftId,
+    mimeOpts,
+    accessToken
+  );
+
+  if (flow.ok && flow.sent) {
+    return {
+      ok: true,
+      sent: true,
+      sendError: "",
+      oldDraftDeleted: Boolean(flow.oldDeleted),
+      warning: flow.error || "",
+      firstTo: payload.firstTo,
+      subject: subject,
+      bodyHtml: bodyHtml,
+    };
+  }
+
+  // Fallback: messages.send, then delete old plaintext draft
+  var sendRes = gmailMessagesSendWithToken_(accessToken, mimeOpts);
+  if (!sendRes.ok) {
+    return {
+      ok: false,
+      error:
+        flow.sendError ||
+        flow.error ||
+        sendRes.error ||
+        "Send failed. Re-authorize the SecureDocShare add-on and try again.",
+    };
+  }
+
+  var oldDeleted = false;
+  var warning = "";
+  if (oldDraftId) {
+    var del = gmailDraftDelete_(oldDraftId, accessToken);
+    if (del.ok) {
+      oldDeleted = true;
+    } else {
+      warning =
+        "Encrypted mail sent, but the old plaintext draft could not be deleted. Discard the open compose window.";
+    }
   } else {
-    sendErr = sendRes.error || "Send failed.";
+    oldDeleted = true;
+  }
+
+  if (flow.newDraftId) {
+    gmailDraftDelete_(flow.newDraftId, accessToken);
   }
 
   return {
     ok: true,
-    sent: sent,
-    sendError: sendErr,
+    sent: true,
+    sendError: "",
+    oldDraftDeleted: oldDeleted,
+    warning: warning,
     firstTo: payload.firstTo,
     subject: subject,
     bodyHtml: bodyHtml,
@@ -440,13 +507,13 @@ function buildComposeDirectCard_(e) {
       CardService.newCardSection()
         .addWidget(
           CardService.newTextParagraph().setText(
-            "Encrypts this draft, replaces the compose body, and sends."
+            "Encrypts this draft, sends the encrypted mail, and deletes the plaintext draft. Gmail uses your SecureDocShare Google OAuth client (not the Chrome extension)."
           )
         )
         .addWidget(
           CardService.newButtonSet().addButton(
             CardService.newTextButton()
-              .setText("Encrypt & update compose")
+              .setText("Encrypt & send")
               .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
               .setOnClickAction(
                 CardService.newAction().setFunctionName(
@@ -459,8 +526,84 @@ function buildComposeDirectCard_(e) {
     .build();
 }
 
+function buildComposeSentCard_(result) {
+  result = result || {};
+  var lines = ["Encrypted mail sent successfully."];
+  if (result.oldDraftDeleted) {
+    lines.push("Plain text draft removed. Please close this compose window and open a new one to send another email.");
+  } else if (result.warning) {
+    lines.push(String(result.warning));
+  }
+
+  return CardService.newCardBuilder()
+    .setHeader(cardHeader_("SecureDocShare", "Sent"))
+    .addSection(
+      CardService.newCardSection()
+        .addWidget(CardService.newTextParagraph().setText(lines.join("\n")))
+        // .addWidget(
+        //   CardService.newButtonSet().addButton(
+        //     CardService.newTextButton()
+        //       .setText("Done")
+        //       .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+        //       .setOnClickAction(
+        //         CardService.newAction().setFunctionName("onComposeSentDone_")
+        //       )
+        //   )
+        // )
+    )
+    .build();
+}
+
+function onComposeSentDone_(e) {
+  return CardService.newActionResponseBuilder()
+    .setNavigation(
+      CardService.newNavigation().updateCard(buildMainCard_(e))
+    )
+    .build();
+}
+
+/** Open Google OAuth with YOUR web client — full window, asks all Gmail scopes. */
+function openMarketplaceGmailConnect_(e, message) {
+  var session = getWorkspaceSession_() || {};
+  if (!session.token) {
+    return notify_("Sign in to SecureDocShare first.");
+  }
+  var connect = apiGmailConnectUrl_(session.token);
+  if (!connect.ok || !connect.url) {
+    return notify_(
+      connect.error ||
+        "Could not start Gmail connect. Deploy the server with /auth/gmail/connect, then try again."
+    );
+  }
+  return CardService.newActionResponseBuilder()
+    .setNotification(
+      CardService.newNotification().setText(
+        "Opening Google — allow Gmail access, then tap Encrypt & send again."
+      )
+    )
+    .setOpenLink(
+      CardService.newOpenLink()
+        .setUrl(connect.url)
+        .setOpenAs(CardService.OpenAs.FULL_SIZE)
+        .setOnClose(CardService.OnClose.RELOAD)
+    )
+    .build();
+}
+
 function onComposeEncryptAndSend_(e) {
-  var result = runComposeEncryptAndSendCore_(e);
+  var result;
+  try {
+    result = runComposeEncryptAndSendCore_(e);
+  } catch (err) {
+    return CardService.newActionResponseBuilder()
+      .setNotification(
+        CardService.newNotification().setText(
+          "Encrypt/send error: " +
+            String(err && err.message ? err.message : err)
+        )
+      )
+      .build();
+  }
 
   if (result.needLogin) {
     return CardService.newActionResponseBuilder()
@@ -475,7 +618,20 @@ function onComposeEncryptAndSend_(e) {
       .build();
   }
 
+  if (result.needGmailConnect) {
+    return openMarketplaceGmailConnect_(e, result.error);
+  }
+
   if (!result.ok) {
+    // Fallback: any Gmail-not-connected style error should open Google prompt.
+    if (
+      result.code === "GMAIL_NOT_CONNECTED" ||
+      /Connect Gmail|Gmail not connected|GMAIL_NOT_CONNECTED/i.test(
+        String(result.error || "")
+      )
+    ) {
+      return openMarketplaceGmailConnect_(e, result.error);
+    }
     return CardService.newActionResponseBuilder()
       .setNotification(
         CardService.newNotification().setText(result.error || "Failed.")
@@ -487,40 +643,26 @@ function onComposeEncryptAndSend_(e) {
     return CardService.newActionResponseBuilder()
       .setNotification(
         CardService.newNotification().setText(
-          result.sendError ||
-            "Encrypted but send failed. Allow Gmail in the Chrome extension."
+          result.sendError || "Encrypted but send failed."
         )
       )
       .build();
   }
 
-  var updateBuilder = CardService.newUpdateDraftActionResponseBuilder()
-    .setUpdateDraftBodyAction(
-      CardService.newUpdateDraftBodyAction()
-        .addUpdateContent(
-          result.bodyHtml || "",
-          CardService.ContentType.MUTABLE_HTML
-        )
-        .setUpdateType(CardService.UpdateDraftBodyType.IN_PLACE_INSERT)
-    );
-
-  if (result.subject) {
-    updateBuilder.setUpdateDraftSubjectAction(
-      CardService.newUpdateDraftSubjectAction().addUpdateSubject(result.subject)
-    );
+  var note = "Encrypted mail sent.";
+  if (result.oldDraftDeleted) {
+    note += "";
+  } else if (result.warning) {
+    note += " " + result.warning;
   }
 
-  try {
-    if (result.firstTo) {
-      updateBuilder.setUpdateDraftToRecipientsAction(
-        CardService.newUpdateDraftToRecipientsAction().addUpdateToRecipients([
-          result.firstTo,
-        ])
-      );
-    }
-  } catch (eTo) {}
-
-  return updateBuilder.build();
+  return CardService.newActionResponseBuilder()
+    .setNotification(CardService.newNotification().setText(note))
+    .setStateChanged(true)
+    .setNavigation(
+      CardService.newNavigation().updateCard(buildComposeSentCard_(result))
+    )
+    .build();
 }
 
 function buildSecureComposeBodyHtml_(cipher, meta) {
