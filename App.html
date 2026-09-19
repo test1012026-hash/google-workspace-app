@@ -32,6 +32,71 @@ var _sessionEmail = "";
 var _subscriptionActive = false;
 var _sessionToken = "";
 var _recipientInput = null;
+var SIGNUP_DRAFT_KEY = "sds_workspace_signup_draft";
+
+function saveSignupDraft_(email, password, acceptTerms) {
+  try {
+    sessionStorage.setItem(
+      SIGNUP_DRAFT_KEY,
+      JSON.stringify({
+        email: String(email || "").trim(),
+        password: String(password || ""),
+        acceptTerms: Boolean(acceptTerms),
+        otpSent: Boolean(_signupOtpSent),
+      })
+    );
+  } catch (e) {}
+}
+
+function loadSignupDraft_() {
+  try {
+    var raw = sessionStorage.getItem(SIGNUP_DRAFT_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function clearSignupDraft_() {
+  try {
+    sessionStorage.removeItem(SIGNUP_DRAFT_KEY);
+  } catch (e) {}
+}
+
+function applySignupDraftToForm_() {
+  var draft = loadSignupDraft_();
+  if (!draft) return;
+  var emailEl = document.getElementById("login-email");
+  var passEl = document.getElementById("login-password");
+  var termsBox = document.getElementById("accept-terms");
+  var otpRow = document.getElementById("otp-row");
+  var hint = document.getElementById("otp-hint");
+  var btn = document.getElementById("btn-login");
+  if (emailEl && draft.email) emailEl.value = draft.email;
+  if (passEl && draft.password) passEl.value = draft.password;
+  if (termsBox && draft.acceptTerms) termsBox.checked = true;
+  if (draft.otpSent && _authMode === "signup") {
+    _signupOtpSent = true;
+    if (otpRow) otpRow.style.display = "block";
+    if (hint) hint.textContent = "Enter the 4-digit code from your email.";
+    if (btn) btn.textContent = "Verify & sign up";
+  }
+}
+
+function readSignupFormOrDraft_() {
+  var emailEl = document.getElementById("login-email");
+  var passEl = document.getElementById("login-password");
+  var termsBox = document.getElementById("accept-terms");
+  var draft = loadSignupDraft_() || {};
+  var email = emailEl ? String(emailEl.value || "").trim() : "";
+  var password = passEl ? String(passEl.value || "") : "";
+  if (!email) email = String(draft.email || "").trim();
+  if (!password) password = String(draft.password || "");
+  var acceptTerms =
+    (termsBox && termsBox.checked) || draft.acceptTerms === true;
+  return { email: email, password: password, acceptTerms: acceptTerms };
+}
 
 document.addEventListener("DOMContentLoaded", function () {
   if (window.__COMPOSE_MODAL__) {
@@ -39,7 +104,12 @@ document.addEventListener("DOMContentLoaded", function () {
     return;
   }
   initAuthUi();
-  setAuthMode("login");
+  var bootDraft = loadSignupDraft_();
+  if (bootDraft && bootDraft.otpSent) {
+    setAuthMode("signup");
+  } else {
+    setAuthMode("login");
+  }
   bindModeTabs();
   initRecipientChips_();
   bindEncryptUi();
@@ -356,8 +426,12 @@ function handleSsoLaunchQuery_() {
 }
 
 function setAuthMode(next) {
+  var leavingSignup = _authMode === "signup" && next !== "signup";
   _authMode = next === "signup" ? "signup" : "login";
-  _signupOtpSent = false;
+  if (leavingSignup || _authMode === "login") {
+    _signupOtpSent = false;
+    if (leavingSignup) clearSignupDraft_();
+  }
   setLoginError("");
 
   var title = document.getElementById("auth-title");
@@ -373,21 +447,23 @@ function setAuthMode(next) {
   var passEl = document.getElementById("login-password");
 
   if (title) title.textContent = _authMode === "signup" ? "Sign up" : "Log in";
-  // if (hint) {
-  //   hint.textContent =
-  //     "Encrypt and share documents with identity-locked access.";
-  // }
   if (termsRow) termsRow.style.display = _authMode === "signup" ? "flex" : "none";
-  if (otpRow) otpRow.style.display = "none";
-  if (otpEl) otpEl.value = "";
-  if (otpHint) otpHint.textContent = "";
-  if (termsBox) termsBox.checked = false;
+  if (_authMode !== "signup") {
+    if (otpRow) otpRow.style.display = "none";
+    if (otpEl) otpEl.value = "";
+    if (otpHint) otpHint.textContent = "";
+    if (termsBox) termsBox.checked = false;
+  }
   if (termsLink && typeof SecureDocConfig !== "undefined" && SecureDocConfig.getTermsUrl) {
     termsLink.href = SecureDocConfig.getTermsUrl();
   }
   if (btn) {
     btn.textContent =
-      _authMode === "signup" ? "Send verification code" : "Log in";
+      _authMode === "signup"
+        ? _signupOtpSent
+          ? "Verify & sign up"
+          : "Send verification code"
+        : "Log in";
     btn.disabled = false;
   }
   if (toggle) {
@@ -399,6 +475,9 @@ function setAuthMode(next) {
   if (passEl) {
     passEl.autocomplete =
       _authMode === "signup" ? "new-password" : "current-password";
+  }
+  if (_authMode === "signup") {
+    applySignupDraftToForm_();
   }
 }
 
@@ -453,6 +532,7 @@ function initAuthUi() {
           _sessionToken = "";
           _subscriptionActive = false;
           syncSessionToAppsScript(null);
+          clearSignupDraft_();
           setAuthMode("login");
           resetToolPanels();
           refreshAuthState(function () {});
@@ -548,14 +628,13 @@ function setLoginError(msg) {
 }
 
 function onResendSignupOtp() {
-  var emailEl = document.getElementById("login-email");
-  var termsBox = document.getElementById("accept-terms");
-  var email = emailEl ? String(emailEl.value || "").trim() : "";
+  var fields = readSignupFormOrDraft_();
+  var email = fields.email;
   if (!email) {
     setLoginError("Enter email first.");
     return;
   }
-  if (!termsBox || !termsBox.checked) {
+  if (!fields.acceptTerms) {
     setLoginError("Accept Terms & Conditions.");
     return;
   }
@@ -563,6 +642,8 @@ function onResendSignupOtp() {
     setLoginError("Signup helper not loaded.");
     return;
   }
+  saveSignupDraft_(email, fields.password, true);
+  applySignupDraftToForm_();
   setLoginError("");
   sendSignupOtp({
     email: email,
@@ -572,19 +653,21 @@ function onResendSignupOtp() {
     var hint = document.getElementById("otp-hint");
     if (!res || !res.ok) {
       setLoginError((res && res.error) || "Could not resend code");
+      applySignupDraftToForm_();
       return;
     }
+    _signupOtpSent = true;
+    saveSignupDraft_(email, fields.password, true);
+    applySignupDraftToForm_();
     if (hint) hint.textContent = "A new code was sent.";
   });
 }
 
 function onTaskpaneAuthSubmit() {
-  var emailEl = document.getElementById("login-email");
-  var passEl = document.getElementById("login-password");
-  var termsBox = document.getElementById("accept-terms");
+  var fields = readSignupFormOrDraft_();
+  var email = fields.email;
+  var password = fields.password;
   var otpEl = document.getElementById("signup-otp");
-  var email = emailEl ? String(emailEl.value || "").trim() : "";
-  var password = passEl ? String(passEl.value || "") : "";
   var otp = otpEl ? String(otpEl.value || "").trim() : "";
   var isSignup = _authMode === "signup";
 
@@ -616,11 +699,13 @@ function onTaskpaneAuthSubmit() {
   }
 
   if (isSignup && !_signupOtpSent) {
-    if (!termsBox || !termsBox.checked) {
+    if (!fields.acceptTerms) {
       resetBtn();
       setLoginError("Accept Terms & Conditions.");
       return;
     }
+    saveSignupDraft_(email, password, true);
+    applySignupDraftToForm_();
     sendSignupOtp({
       email: email,
       acceptTerms: true,
@@ -630,9 +715,12 @@ function onTaskpaneAuthSubmit() {
         if (!res || !res.ok) {
           resetBtn();
           setLoginError((res && res.error) || "Could not send code");
+          applySignupDraftToForm_();
           return;
         }
         _signupOtpSent = true;
+        saveSignupDraft_(email, password, true);
+        applySignupDraftToForm_();
         var otpRow = document.getElementById("otp-row");
         var hint = document.getElementById("otp-hint");
         if (otpRow) otpRow.style.display = "block";
@@ -645,6 +733,7 @@ function onTaskpaneAuthSubmit() {
       .catch(function (err) {
         resetBtn();
         setLoginError(err.message || String(err));
+        applySignupDraftToForm_();
       });
     return;
   }
@@ -668,18 +757,21 @@ function onTaskpaneAuthSubmit() {
       resetBtn();
       if (!res || !res.ok) {
         setLoginError((res && res.error) || "Authentication failed");
+        if (isSignup) applySignupDraftToForm_();
         return;
       }
+      clearSignupDraft_();
       _signupOtpSent = false;
+      var passEl = document.getElementById("login-password");
       if (passEl) passEl.value = "";
       if (otpEl) otpEl.value = "";
-      if (termsBox) termsBox.checked = false;
-      setAuthMode("login");
+      syncSessionToAppsScript(res);
       refreshAuthState(function () {});
     })
     .catch(function (err) {
       resetBtn();
       setLoginError(err.message || String(err));
+      if (isSignup) applySignupDraftToForm_();
     });
 }
 

@@ -443,6 +443,10 @@ function buildLoginSection_(e) {
   var otpSent =
     PropertiesService.getUserProperties().getProperty("SDS_CARD_OTP_SENT") ===
     "1";
+  var draft = typeof loadCardSignupDraft_ === "function" ? loadCardSignupDraft_() : null;
+  var draftEmail = draft && draft.email ? String(draft.email) : "";
+  var draftPassword = draft && draft.password ? String(draft.password) : "";
+  var draftTerms = Boolean(draft && draft.acceptTerms === true);
 
   var section = CardService.newCardSection().setHeader("Account");
 
@@ -452,25 +456,24 @@ function buildLoginSection_(e) {
     )
   );
 
-  section
-    .addWidget(
-      CardService.newTextInput()
-        .setFieldName("login_email")
-        .setTitle("Email")
-        .setHint("you@company.com")
-    )
-    .addWidget(
-      CardService.newTextInput()
-        .setFieldName("login_password")
-        .setTitle("Password")
-    );
+  var emailInput = CardService.newTextInput()
+    .setFieldName("login_email")
+    .setTitle("Email")
+  if (isSignup && draftEmail) emailInput.setValue(draftEmail);
+
+  var passwordInput = CardService.newTextInput()
+    .setFieldName("login_password")
+    .setTitle("Password");
+  if (isSignup && draftPassword) passwordInput.setValue(draftPassword);
+
+  section.addWidget(emailInput).addWidget(passwordInput);
 
   if (isSignup) {
     section.addWidget(
       CardService.newSelectionInput()
         .setType(CardService.SelectionInputType.CHECK_BOX)
         .setFieldName("accept_terms")
-        .addItem("I agree to the Terms & Conditions", "yes", false)
+        .addItem("I agree to the Terms & Conditions", "yes", draftTerms)
     );
   }
 
@@ -1080,9 +1083,39 @@ function onCardToggleAuthMode_(e) {
   var next = params.authMode === "signup" ? "signup" : "login";
   setCardAuthMode_(next);
   PropertiesService.getUserProperties().deleteProperty("SDS_CARD_OTP_SENT");
+  clearCardSignupDraft_();
   return CardService.newActionResponseBuilder()
     .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
     .build();
+}
+
+var CARD_SIGNUP_DRAFT_KEY = "SDS_CARD_SIGNUP_DRAFT";
+
+function saveCardSignupDraft_(email, password, acceptTerms) {
+  PropertiesService.getUserProperties().setProperty(
+    CARD_SIGNUP_DRAFT_KEY,
+    JSON.stringify({
+      email: String(email || "").trim(),
+      password: String(password || ""),
+      acceptTerms: Boolean(acceptTerms),
+    })
+  );
+}
+
+function loadCardSignupDraft_() {
+  try {
+    var raw = PropertiesService.getUserProperties().getProperty(
+      CARD_SIGNUP_DRAFT_KEY
+    );
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function clearCardSignupDraft_() {
+  PropertiesService.getUserProperties().deleteProperty(CARD_SIGNUP_DRAFT_KEY);
 }
 
 function onCardGoogleSignIn_(e) {
@@ -1122,15 +1155,19 @@ function onCardGoogleSignIn_(e) {
 
 function onCardResendOtp_(e) {
   var form = (e && e.formInput) || {};
-  var email = String(form.login_email || "").trim();
+  var draft = loadCardSignupDraft_() || {};
+  var email = String(form.login_email || draft.email || "").trim();
   if (!email) return notify_("Enter email first.");
   var terms = form.accept_terms;
   var accepted =
     terms === "yes" ||
-    (Array.isArray(terms) && terms.indexOf("yes") >= 0);
+    (Array.isArray(terms) && terms.indexOf("yes") >= 0) ||
+    draft.acceptTerms === true;
   if (!accepted) {
     return notify_("Accept Terms & Conditions to sign up.");
   }
+  var password = String(form.login_password || draft.password || "");
+  saveCardSignupDraft_(email, password, true);
   var sent = apiSignupSendOtp_(email, true);
   if (!sent.ok) return notify_(sent.error || "Could not send code.");
   PropertiesService.getUserProperties().setProperty("SDS_CARD_OTP_SENT", "1");
@@ -1147,8 +1184,9 @@ function onCardResendOtp_(e) {
 
 function onCardLogin_(e) {
   var form = (e && e.formInput) || {};
-  var email = String(form.login_email || "").trim();
-  var password = String(form.login_password || "");
+  var draft = loadCardSignupDraft_() || {};
+  var email = String(form.login_email || draft.email || "").trim();
+  var password = String(form.login_password || draft.password || "");
   var mode = getCardAuthMode_(e);
   var isSignup = mode === "signup";
 
@@ -1160,7 +1198,8 @@ function onCardLogin_(e) {
     var terms = form.accept_terms;
     var accepted =
       terms === "yes" ||
-      (Array.isArray(terms) && terms.indexOf("yes") >= 0);
+      (Array.isArray(terms) && terms.indexOf("yes") >= 0) ||
+      draft.acceptTerms === true;
     if (!accepted) {
       return notify_("Accept Terms & Conditions to sign up.");
     }
@@ -1171,6 +1210,7 @@ function onCardLogin_(e) {
     if (!otpSent) {
       var send = apiSignupSendOtp_(email, true);
       if (!send.ok) return notify_(send.error || "Could not send code.");
+      saveCardSignupDraft_(email, password, true);
       PropertiesService.getUserProperties().setProperty("SDS_CARD_OTP_SENT", "1");
       return CardService.newActionResponseBuilder()
         .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
@@ -1191,6 +1231,7 @@ function onCardLogin_(e) {
     var signed = apiSignup_(email, password, otp, true);
     if (!signed.ok) return notify_(signed.error || "Signup failed.");
     PropertiesService.getUserProperties().deleteProperty("SDS_CARD_OTP_SENT");
+    clearCardSignupDraft_();
     setCardAuthMode_("login");
     saveWorkspaceSession({
       token: signed.token,
@@ -1249,6 +1290,7 @@ function onCardLogout_(e) {
   clearWorkspaceSession();
   setCardAuthMode_("login");
   PropertiesService.getUserProperties().deleteProperty("SDS_CARD_OTP_SENT");
+  clearCardSignupDraft_();
   return CardService.newActionResponseBuilder()
     .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
     .setNotification(CardService.newNotification().setText("Signed out."))

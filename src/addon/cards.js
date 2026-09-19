@@ -100,6 +100,10 @@ function buildLoginSection_(e) {
   var otpSent =
     PropertiesService.getUserProperties().getProperty("SDS_CARD_OTP_SENT") ===
     "1";
+  var draft = typeof loadCardSignupDraft_ === "function" ? loadCardSignupDraft_() : null;
+  var draftEmail = draft && draft.email ? String(draft.email) : "";
+  var draftPassword = draft && draft.password ? String(draft.password) : "";
+  var draftTerms = Boolean(draft && draft.acceptTerms === true);
 
   var section = CardService.newCardSection().setHeader("Account");
 
@@ -109,25 +113,25 @@ function buildLoginSection_(e) {
     )
   );
 
-  section
-    .addWidget(
-      CardService.newTextInput()
-        .setFieldName("login_email")
-        .setTitle("Email")
-        .setHint("you@company.com")
-    )
-    .addWidget(
-      CardService.newTextInput()
-        .setFieldName("login_password")
-        .setTitle("Password")
-    );
+  var emailInput = CardService.newTextInput()
+    .setFieldName("login_email")
+    .setTitle("Email")
+    .setHint("you@company.com");
+  if (isSignup && draftEmail) emailInput.setValue(draftEmail);
+
+  var passwordInput = CardService.newTextInput()
+    .setFieldName("login_password")
+    .setTitle("Password");
+  if (isSignup && draftPassword) passwordInput.setValue(draftPassword);
+
+  section.addWidget(emailInput).addWidget(passwordInput);
 
   if (isSignup) {
     section.addWidget(
       CardService.newSelectionInput()
         .setType(CardService.SelectionInputType.CHECK_BOX)
         .setFieldName("accept_terms")
-        .addItem("I agree to the Terms & Conditions", "yes", false)
+        .addItem("I agree to the Terms & Conditions", "yes", draftTerms)
     );
   }
 
