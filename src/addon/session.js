@@ -48,7 +48,7 @@ function verifyLoginAndSubscription_() {
   return {
     ok: true,
     token: session.token,
-    email: sub.email || session.email,
+    email: String(sub.email || session.email || "").trim(),
     subscriptionActive: true,
   };
 }

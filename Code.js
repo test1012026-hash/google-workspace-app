@@ -459,6 +459,7 @@ function buildLoginSection_(e) {
   var emailInput = CardService.newTextInput()
     .setFieldName("login_email")
     .setTitle("Email")
+    .setHint("you@company.com");
   if (isSignup && draftEmail) emailInput.setValue(draftEmail);
 
   var passwordInput = CardService.newTextInput()
@@ -1513,10 +1514,45 @@ function runComposeEncryptAndSendCore_(e) {
     };
   }
 
+  // Reply/forward: encrypt only the NEW text; decrypt parent sds. to clear text.
+  // Parent sdmeta.v1.… stays as-is in the quoted block.
+  var split = splitComposeNewAndQuoted_(payload.message);
+  var newMessage = String(split.newText || "").trim();
+  var quotedBlock = String(split.quotedBlock || "").trim();
+  var quotedClear = "";
+
+  if (quotedBlock) {
+    var sessionEmail =
+      (gate.email && String(gate.email)) ||
+      (getWorkspaceSession_() && getWorkspaceSession_().email) ||
+      "";
+    var quoteDec = decryptQuotedParentSds_(
+      quotedBlock,
+      gate.token,
+      sessionEmail
+    );
+    if (!quoteDec.ok) {
+      return {
+        ok: false,
+        error:
+          quoteDec.error ||
+          "Could not decrypt the quoted parent message. Open the original mail, decrypt once, then try again.",
+      };
+    }
+    quotedClear = String(quoteDec.text || "").trim();
+  }
+
+  if (!newMessage) {
+    // Pure forward / empty reply body — still send an encrypted wrapper.
+    newMessage = quotedClear
+      ? "Forwarded message"
+      : String(payload.message || "").trim();
+  }
+
   var enc = apiEncrypt_(
     payload.firstTo,
     payload.subject,
-    payload.message,
+    newMessage,
     gate.token
   );
   if (!enc.ok) {
@@ -1525,8 +1561,8 @@ function runComposeEncryptAndSendCore_(e) {
 
   var cipher = enc.messageCipherText || "";
   var meta = enc.mailMetadata || null;
-  var bodyHtml = buildSecureComposeBodyHtml_(cipher, meta);
-  var bodyText = buildSecureComposeBodyText_(cipher, meta);
+  var bodyHtml = buildSecureComposeBodyHtml_(cipher, meta, quotedClear);
+  var bodyText = buildSecureComposeBodyText_(cipher, meta, quotedClear);
   var toHeader = payload.toJoined || payload.firstTo;
   var subject = payload.subject || "Secure document";
   var oldDraftId =
@@ -1784,7 +1820,7 @@ function onComposeEncryptAndSend_(e) {
     .build();
 }
 
-function buildSecureComposeBodyHtml_(cipher, meta) {
+function buildSecureComposeBodyHtml_(cipher, meta, quotedClear) {
   var parts = [];
   parts.push(
     '<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.4;color:#202124">'
@@ -1813,8 +1849,133 @@ function buildSecureComposeBodyHtml_(cipher, meta) {
     parts.push("</div>");
   }
 
+  var siteUrl = String(ADMIN_URL || "https://admin-panel-amber-nine.vercel.app").replace(
+    /\/$/,
+    ""
+  );
+  parts.push(
+    '<div style="margin-top:14px;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.45;color:#475569">' +
+      "To know more, visit our website: " +
+      '<a href="' +
+      escapeHtml_(siteUrl) +
+      '" style="color:#0F766E;font-weight:600;text-decoration:underline" target="_blank" rel="noopener noreferrer">' +
+      escapeHtml_(siteUrl) +
+      "</a></div>"
+  );
+
+  var quote = String(quotedClear || "").trim();
+  if (quote) {
+    parts.push(
+      '<div style="margin-top:16px;padding-top:12px;border-top:1px solid #dadce0;color:#5f6368;font-size:12px;line-height:1.45;white-space:pre-wrap">' +
+        escapeHtml_(quote).replace(/\n/g, "<br>") +
+        "</div>"
+    );
+  }
+
   parts.push("</div>");
   return parts.join("");
+}
+
+/**
+ * Split reply/forward draft into new text vs quoted parent thread.
+ */
+function splitComposeNewAndQuoted_(body) {
+  var text = String(body || "").replace(/\r\n/g, "\n");
+  if (!String(text).trim()) {
+    return { newText: "", quotedBlock: "" };
+  }
+
+  var patterns = [
+    /\nOn .{8,240}?wrote:\s*\n/i,
+    /\n-+\s*Original Message\s*-+\s*\n/i,
+    /\n-+\s*Forwarded message\s*-+\s*\n/i,
+    /\nBegin forwarded message:\s*\n/i,
+  ];
+
+  var bestStart = -1;
+  for (var p = 0; p < patterns.length; p++) {
+    var m = patterns[p].exec(text);
+    if (!m) continue;
+    var start = m.index;
+    if (text.charAt(start) === "\n") start += 1;
+    if (bestStart < 0 || start < bestStart) bestStart = start;
+  }
+
+  // Fallback: quoted ciphertext after blank line(s) when reply markers missing.
+  if (bestStart < 0) {
+    var sdsAt = text.search(/(?:^|\n)sds\./i);
+    if (sdsAt > 0) {
+      bestStart = text.charAt(sdsAt) === "\n" ? sdsAt + 1 : sdsAt;
+      // Prefer split at blank line before sds if present.
+      var before = text.slice(0, bestStart);
+      var blank = before.lastIndexOf("\n\n");
+      if (blank >= 0 && blank + 2 < bestStart) {
+        bestStart = blank + 2;
+      }
+    }
+  }
+
+  if (bestStart < 0) {
+    return { newText: text.trim(), quotedBlock: "" };
+  }
+
+  return {
+    newText: text.slice(0, bestStart).trim(),
+    quotedBlock: text.slice(bestStart).trim(),
+  };
+}
+
+/**
+ * Decrypt sds. tokens in quoted parent text → clear message.
+ * Leaves sdmeta.v1.… / email: / uuid: lines unchanged.
+ * Uses the signed-in user's email (keys for the mail they received).
+ */
+function decryptQuotedParentSds_(quotedBlock, authToken, recipientEmail) {
+  var out = String(quotedBlock || "");
+  if (!out || !/sds\./i.test(out)) {
+    return { ok: true, text: out, decrypted: false };
+  }
+
+  var email = String(recipientEmail || "").trim();
+  if (!email || email.indexOf("@") < 0) {
+    var session = getWorkspaceSession_() || {};
+    email = String(session.email || "").trim();
+  }
+  if (!email || email.indexOf("@") < 0) {
+    return {
+      ok: false,
+      error:
+        "Signed-in email missing. Sign out and sign in again, then retry Encrypt & send.",
+      text: out,
+    };
+  }
+
+  var replaced = 0;
+  var guard = 0;
+  while (guard++ < 12) {
+    var span = extractSdsCipherSpan_(out);
+    if (!span) break;
+    var dec = apiDecrypt_({
+      email: email,
+      messageCipherText: span.cipher,
+      token: authToken,
+    });
+    if (!dec.ok) {
+      return {
+        ok: false,
+        error:
+          formatDecryptError_(dec, "Could not decrypt quoted parent message.") ||
+          "Could not decrypt quoted parent message.",
+        text: out,
+      };
+    }
+    var plain = String(dec.message || "").trim();
+    if (!plain) plain = "[Decrypted message was empty]";
+    out = out.slice(0, span.start) + plain + out.slice(span.end);
+    replaced += 1;
+  }
+
+  return { ok: true, text: out, decrypted: replaced > 0 };
 }
 
 function saveWorkspaceSession(session) {
@@ -1867,7 +2028,7 @@ function verifyLoginAndSubscription_() {
   return {
     ok: true,
     token: session.token,
-    email: sub.email || session.email,
+    email: String(sub.email || session.email || "").trim(),
     subscriptionActive: true,
   };
 }
@@ -2673,14 +2834,28 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
       if (!emailsOverlap_(targets, draftTos)) continue;
       score += 10;
     } else if (draftTos.length) {
-      continue;
+      // Reply/forward: compose event often omits To — still match drafts that have recipients.
+      score += 8;
     } else {
       score += 1;
     }
 
-    if (subjectWant && String(subj || "").trim().toLowerCase() === subjectWant) {
+    const subjNorm = String(subj || "").trim().toLowerCase();
+    if (subjectWant && subjNorm === subjectWant) {
       score += 5;
+    } else if (
+      subjectWant &&
+      (subjNorm.indexOf(subjectWant) >= 0 || subjectWant.indexOf(subjNorm) >= 0)
+    ) {
+      score += 3;
+    } else if (/^(re|fw|fwd)\s*:/i.test(subjNorm)) {
+      score += 2;
     }
+
+    // Prefer drafts that look like the open reply (have a body).
+    const body = extractMessagePlainBody_(payload);
+    if (body && body.length > 0) score += 1;
+    if (/sds\./i.test(body) || /On .+wrote:/i.test(body)) score += 2;
 
     const candidate = {
       ok: true,
@@ -2689,7 +2864,7 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
       toHeader: toHdr,
       toEmails: draftTos.length ? draftTos : targets,
       subject: subj || "",
-      body: extractMessagePlainBody_(payload),
+      body: body,
       ccHeader: getMimeHeader_(headers, "Cc"),
       bccHeader: getMimeHeader_(headers, "Bcc"),
       score: score,
@@ -2902,13 +3077,27 @@ function gmailMessagesSendWithToken_(accessToken, options) {
   }
 }
 
-function buildSecureComposeBodyText_(cipher, meta) {
+function buildSecureComposeBodyText_(cipher, meta, quotedClear) {
   const lines = [String(cipher || "").replace(/\s+/g, "")];
   if (meta && (meta.token || meta.emailEnc || meta.uuidEnc)) {
     lines.push("");
     if (meta.token) lines.push(String(meta.token).replace(/\s+/g, ""));
     if (meta.emailEnc) lines.push("email: " + meta.emailEnc);
     if (meta.uuidEnc) lines.push("uuid: " + meta.uuidEnc);
+  }
+  lines.push("");
+  lines.push(
+    "To know more, visit our website: " +
+      String(
+        typeof ADMIN_URL !== "undefined" && ADMIN_URL
+          ? ADMIN_URL
+          : "https://admin-panel-amber-nine.vercel.app"
+      ).replace(/\/$/, "")
+  );
+  const quote = String(quotedClear || "").trim();
+  if (quote) {
+    lines.push("");
+    lines.push(quote);
   }
   return lines.join("\n");
 }
@@ -2968,11 +3157,16 @@ function extractCipherFromMessage_(e) {
   return scanMessageForSecureDoc_(e).cipher || "";
 }
 
-function extractSdsCipher_(text) {
+/**
+ * First sds. token in text, including start/end indexes in the original string
+ * (whitespace inside the token is skipped when building cipher but included in the span).
+ */
+function extractSdsCipherSpan_(text) {
   var raw = String(text || "");
   var match = /sds\./i.exec(raw);
-  if (!match) return "";
+  if (!match) return null;
 
+  var start = match.index;
   var i = match.index + 4;
   var b64 = "";
   while (i < raw.length) {
@@ -2990,14 +3184,26 @@ function extractSdsCipher_(text) {
       b64 += "=";
       i += 1;
       while (i < raw.length && /\s/.test(raw.charAt(i))) i += 1;
-      if (raw.charAt(i) === "=") b64 += "=";
+      if (raw.charAt(i) === "=") {
+        b64 += "=";
+        i += 1;
+      }
       break;
     }
     break;
   }
 
-  if (b64.length < 8) return "";
-  return "sds." + b64;
+  if (b64.length < 8) return null;
+  return {
+    cipher: "sds." + b64,
+    start: start,
+    end: i,
+  };
+}
+
+function extractSdsCipher_(text) {
+  var span = extractSdsCipherSpan_(text);
+  return span ? span.cipher : "";
 }
 
 /**

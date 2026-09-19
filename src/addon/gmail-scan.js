@@ -53,11 +53,16 @@ function extractCipherFromMessage_(e) {
   return scanMessageForSecureDoc_(e).cipher || "";
 }
 
-function extractSdsCipher_(text) {
+/**
+ * First sds. token in text, including start/end indexes in the original string
+ * (whitespace inside the token is skipped when building cipher but included in the span).
+ */
+function extractSdsCipherSpan_(text) {
   var raw = String(text || "");
   var match = /sds\./i.exec(raw);
-  if (!match) return "";
+  if (!match) return null;
 
+  var start = match.index;
   var i = match.index + 4;
   var b64 = "";
   while (i < raw.length) {
@@ -75,14 +80,26 @@ function extractSdsCipher_(text) {
       b64 += "=";
       i += 1;
       while (i < raw.length && /\s/.test(raw.charAt(i))) i += 1;
-      if (raw.charAt(i) === "=") b64 += "=";
+      if (raw.charAt(i) === "=") {
+        b64 += "=";
+        i += 1;
+      }
       break;
     }
     break;
   }
 
-  if (b64.length < 8) return "";
-  return "sds." + b64;
+  if (b64.length < 8) return null;
+  return {
+    cipher: "sds." + b64,
+    start: start,
+    end: i,
+  };
+}
+
+function extractSdsCipher_(text) {
+  var span = extractSdsCipherSpan_(text);
+  return span ? span.cipher : "";
 }
 
 /**

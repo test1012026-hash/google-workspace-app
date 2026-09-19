@@ -205,14 +205,28 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
       if (!emailsOverlap_(targets, draftTos)) continue;
       score += 10;
     } else if (draftTos.length) {
-      continue;
+      // Reply/forward: compose event often omits To — still match drafts that have recipients.
+      score += 8;
     } else {
       score += 1;
     }
 
-    if (subjectWant && String(subj || "").trim().toLowerCase() === subjectWant) {
+    const subjNorm = String(subj || "").trim().toLowerCase();
+    if (subjectWant && subjNorm === subjectWant) {
       score += 5;
+    } else if (
+      subjectWant &&
+      (subjNorm.indexOf(subjectWant) >= 0 || subjectWant.indexOf(subjNorm) >= 0)
+    ) {
+      score += 3;
+    } else if (/^(re|fw|fwd)\s*:/i.test(subjNorm)) {
+      score += 2;
     }
+
+    // Prefer drafts that look like the open reply (have a body).
+    const body = extractMessagePlainBody_(payload);
+    if (body && body.length > 0) score += 1;
+    if (/sds\./i.test(body) || /On .+wrote:/i.test(body)) score += 2;
 
     const candidate = {
       ok: true,
@@ -221,7 +235,7 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
       toHeader: toHdr,
       toEmails: draftTos.length ? draftTos : targets,
       subject: subj || "",
-      body: extractMessagePlainBody_(payload),
+      body: body,
       ccHeader: getMimeHeader_(headers, "Cc"),
       bccHeader: getMimeHeader_(headers, "Bcc"),
       score: score,
@@ -434,13 +448,27 @@ function gmailMessagesSendWithToken_(accessToken, options) {
   }
 }
 
-function buildSecureComposeBodyText_(cipher, meta) {
+function buildSecureComposeBodyText_(cipher, meta, quotedClear) {
   const lines = [String(cipher || "").replace(/\s+/g, "")];
   if (meta && (meta.token || meta.emailEnc || meta.uuidEnc)) {
     lines.push("");
     if (meta.token) lines.push(String(meta.token).replace(/\s+/g, ""));
     if (meta.emailEnc) lines.push("email: " + meta.emailEnc);
     if (meta.uuidEnc) lines.push("uuid: " + meta.uuidEnc);
+  }
+  lines.push("");
+  lines.push(
+    "To know more, visit our website: " +
+      String(
+        typeof ADMIN_URL !== "undefined" && ADMIN_URL
+          ? ADMIN_URL
+          : "https://admin-panel-amber-nine.vercel.app"
+      ).replace(/\/$/, "")
+  );
+  const quote = String(quotedClear || "").trim();
+  if (quote) {
+    lines.push("");
+    lines.push(quote);
   }
   return lines.join("\n");
 }
