@@ -1197,7 +1197,7 @@ function encryptForRecipient_(recipientEmail, form, fileParts) {
     subject: form.subject,
     message: form.message || "",
   };
-  if (fileParts.fileBase64) {
+  if (fileParts && fileParts.fileBase64) {
     payload.fileBase64 = fileParts.fileBase64;
     payload.fileName = fileParts.fileName;
     payload.mimeType = fileParts.mimeType;
@@ -1214,7 +1214,7 @@ function encryptForRecipient_(recipientEmail, form, fileParts) {
       if (code === "FILE_EXTENSION_BLOCKED") {
         throw new Error(
           data.error ||
-            "This file extension is blocked by admin and cannot be encrypted."
+            "This file extension is blocked by admin and cannot be encrypted. Message was not encrypted."
         );
       }
       if (code === "SUBSCRIPTION_EXPIRED" || res.status === 403) {
@@ -1227,12 +1227,22 @@ function encryptForRecipient_(recipientEmail, form, fileParts) {
       }
       throw new Error(data.error || "Encrypt failed.");
     }
+    var attachment = data.attachment || null;
+    var attB64 =
+      (attachment && (attachment.attachmentBase64 || attachment.base64)) ||
+      data.fileCipherText ||
+      null;
+    if (payload.fileBase64 && !attB64) {
+      throw new Error(
+        "Encrypt succeeded but no secure file attachment was returned. Try a smaller PDF."
+      );
+    }
     return {
       ok: true,
       encrypted: true,
       messageCipherText: data.messageCipherText || null,
       fileCipherText: data.fileCipherText || null,
-      attachment: data.attachment || null,
+      attachment: attachment,
       subject: data.subject || form.subject,
       recipientUuid: data.recipientUuid || null,
       recipientEmail: data.recipientEmail || recipientEmail,

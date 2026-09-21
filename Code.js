@@ -265,9 +265,6 @@ function authCallback(request) {
         "<script>window.top.location.replace(" +
         JSON.stringify(appUrl) +
         ");</script>" +
-        "<p><a style='color:#2bb3a0' href='" +
-        escapeHtml_(appUrl) +
-        "'>Continue</a></p>" +
         "</body></html>"
     ).setTitle("Signed in");
   }
@@ -459,7 +456,6 @@ function buildLoginSection_(e) {
   var emailInput = CardService.newTextInput()
     .setFieldName("login_email")
     .setTitle("Email")
-    .setHint("you@company.com");
   if (isSignup && draftEmail) emailInput.setValue(draftEmail);
 
   var passwordInput = CardService.newTextInput()
@@ -856,13 +852,13 @@ function buildAutoDecryptCard_(e, session, scan) {
       .setHeader(cardHeader_("SecureDocShare", "Decrypt failed"))
       .addSection(statusSection)
       .addSection(buildSignedInSection_(session, auth))
-      .addSection(
-        CardService.newCardSection().addWidget(
-          CardService.newButtonSet()
-            .addButton(secondaryBtn_("Refresh", "onRefreshAutoDecrypt_"))
-            .addButton(secondaryBtn_("Home", "onCardBack_"))
-        )
-      )
+      // .addSection(
+      //   CardService.newCardSection().addWidget(
+      //     CardService.newButtonSet()
+      //       .addButton(secondaryBtn_("Refresh", "onRefreshAutoDecrypt_"))
+      //       .addButton(secondaryBtn_("Home", "onCardBack_"))
+      //   )
+      // )
       .build();
   }
 
@@ -1066,10 +1062,10 @@ function onRefreshAutoDecrypt_(e) {
 
 function buildLinksSection_() {
   return CardService.newCardSection()
-    .setHeader("More")
+    .setHeader("Manage your account")
     .addWidget(
       CardService.newTextButton()
-        .setText("Open admin panel")
+        .setText("Visit our website")
         .setOpenLink(
           CardService.newOpenLink()
             .setUrl(ADMIN_URL)
@@ -1471,6 +1467,10 @@ function resolveComposeEncryptPayload_(e, gmailAccessToken) {
     subject: subject,
     message: message,
     matched: matched,
+    files:
+      matched && matched.ok && Array.isArray(matched.files)
+        ? matched.files
+        : [],
   };
 }
 
@@ -1498,6 +1498,16 @@ function runComposeEncryptAndSendCore_(e) {
 
   var accessToken = tokenRes.accessToken;
   var payload = resolveComposeEncryptPayload_(e, accessToken);
+  if (
+    payload.matched &&
+    payload.matched.ok === false &&
+    payload.matched.error
+  ) {
+    return {
+      ok: false,
+      error: payload.matched.error,
+    };
+  }
   if (!payload.firstTo) {
     return {
       ok: false,
@@ -1505,12 +1515,44 @@ function runComposeEncryptAndSendCore_(e) {
         "Add a recipient in To, wait for Gmail autosave, then try again.",
     };
   }
-  if (!String(payload.message || "").trim()) {
+
+  var draftFiles = payload.files || [];
+  var blockedExts =
+    typeof apiFetchBlockedFileExtensions_ === "function"
+      ? apiFetchBlockedFileExtensions_()
+      : [];
+  var blockedAtt =
+    typeof findBlockedDraftAttachment_ === "function"
+      ? findBlockedDraftAttachment_(draftFiles, blockedExts)
+      : null;
+
+  // Same as Outlook: blocked extension → error, do not encrypt message/file.
+  if (blockedAtt) {
+    var blockedExt =
+      (typeof extensionFromFileName_ === "function"
+        ? extensionFromFileName_(blockedAtt.name)
+        : "") || "file";
+    return {
+      ok: false,
+      code: "FILE_EXTENSION_BLOCKED",
+      error:
+        "." +
+        blockedExt +
+        " [blocked extension] is blocked in this app. Nothing was encrypted. Remove the file, then try again.",
+    };
+  }
+
+  var fileToEncrypt =
+    typeof pickDraftFileToEncrypt_ === "function"
+      ? pickDraftFileToEncrypt_(draftFiles, blockedExts)
+      : null;
+
+  if (!String(payload.message || "").trim() && !fileToEncrypt) {
     return {
       ok: false,
       error:
         (payload.matched && payload.matched.error) ||
-        "No draft body found. Type your message, wait for autosave, then try again.",
+        "No draft body or attachment found. Add a message or file, wait for autosave, then try again.",
     };
   }
 
@@ -1519,7 +1561,7 @@ function runComposeEncryptAndSendCore_(e) {
   // - Strip old sdmeta (avoid duplicate / glued "testsdmeta")
   // - Pure forward / empty new body: re-encrypt decrypted plain for the NEW To
   // - Reply with new text: encrypt only the new text; append clear parent (no old meta)
-  var split = splitComposeNewAndQuoted_(payload.message);
+  var split = splitComposeNewAndQuoted_(payload.message || "");
   var newMessage = String(split.newText || "").trim();
   var quotedBlock = String(split.quotedBlock || "").trim();
   var sessionEmail =
@@ -1593,21 +1635,61 @@ function runComposeEncryptAndSendCore_(e) {
     }
   }
 
-  if (!String(messageToEncrypt || "").trim()) {
+  if (!String(messageToEncrypt || "").trim() && !fileToEncrypt) {
     return {
       ok: false,
       error:
-        "Nothing to encrypt. Add a message, or forward an encrypted mail you can decrypt.",
+        "Nothing to encrypt. Add a message or file, or forward an encrypted mail you can decrypt.",
     };
   }
 
-  var enc = apiEncrypt_(
-    payload.firstTo,
-    subject,
-    messageToEncrypt,
-    gate.token
-  );
+  var fileOpts = null;
+  if (fileToEncrypt && fileToEncrypt.content) {
+    fileOpts = {
+      fileBase64: fileToEncrypt.content,
+      fileName: fileToEncrypt.name || "document.bin",
+      mimeType:
+        fileToEncrypt.mimeType ||
+        (typeof guessMimeTypeFromName_ === "function"
+          ? guessMimeTypeFromName_(fileToEncrypt.name)
+          : "application/octet-stream"),
+    };
+  }
+
+  // Valid file first (if any), then message — same order as Outlook.
+  var enc =
+    typeof apiEncryptFileThenMessage_ === "function"
+      ? apiEncryptFileThenMessage_(
+          payload.firstTo,
+          subject,
+          messageToEncrypt || "",
+          gate.token,
+          fileOpts
+        )
+      : apiEncrypt_(
+          payload.firstTo,
+          subject,
+          messageToEncrypt || "",
+          gate.token,
+          fileOpts
+        );
   if (!enc.ok) {
+    if (enc.code === "FILE_EXTENSION_BLOCKED") {
+      var failExt =
+        enc.extension ||
+        (fileOpts && fileOpts.fileName
+          ? extensionFromFileName_(fileOpts.fileName)
+          : "file");
+      return {
+        ok: false,
+        code: "FILE_EXTENSION_BLOCKED",
+        error:
+          enc.error ||
+          "." +
+            failExt +
+            " [blocked extension] is blocked. Nothing was encrypted. Remove the file, then try again.",
+      };
+    }
     return { ok: false, error: enc.error || "Encrypt failed." };
   }
 
@@ -1618,6 +1700,32 @@ function runComposeEncryptAndSendCore_(e) {
   var toHeader = payload.toJoined || payload.firstTo;
   var oldDraftId =
     payload.matched && payload.matched.ok ? payload.matched.draftId || "" : "";
+
+  var encAtt = enc.attachment || null;
+  var encAttB64 =
+    (encAtt && (encAtt.attachmentBase64 || encAtt.base64)) ||
+    enc.fileCipherText ||
+    null;
+  var encAttName =
+    (encAtt && encAtt.fileName) ||
+    (fileToEncrypt && fileToEncrypt.name
+      ? String(fileToEncrypt.name).replace(/\.[^.]+$/, "") + ".securefile"
+      : "encrypted.securefile");
+
+  if (fileToEncrypt && !encAttB64) {
+    return {
+      ok: false,
+      error:
+        "File was encrypted on the server but no secure attachment was returned. Try a smaller PDF, then send again.",
+    };
+  }
+
+  if (!cipher && !encAttB64) {
+    return {
+      ok: false,
+      error: "Encrypt returned no message and no file. Nothing was sent.",
+    };
+  }
 
   var mimeOpts = {
     from: tokenRes.from || "",
@@ -1633,6 +1741,8 @@ function runComposeEncryptAndSendCore_(e) {
     subject: subject,
     html: bodyHtml,
     text: bodyText,
+    attachmentName: encAttB64 ? encAttName : "",
+    attachmentBase64: encAttB64 || "",
   };
 
   // 1) Create encrypted draft → 2) send → 3) delete plaintext draft
@@ -2356,17 +2466,24 @@ function apiGetSubscription_(token) {
   }
 }
 
-function apiEncrypt_(to, subject, message, token) {
+function apiEncrypt_(to, subject, message, token, fileOpts) {
+  fileOpts = fileOpts || {};
   try {
+    var body = {
+      recipientEmail: to,
+      subject: subject || "",
+      message: message || "",
+    };
+    if (fileOpts.fileBase64) {
+      body.fileBase64 = fileOpts.fileBase64;
+      body.fileName = fileOpts.fileName || "document.bin";
+      body.mimeType = fileOpts.mimeType || "application/octet-stream";
+    }
     var res = UrlFetchApp.fetch(API_BASE + "/files/encrypt", {
       method: "post",
       contentType: "application/json",
       headers: { Authorization: "Bearer " + token },
-      payload: JSON.stringify({
-        recipientEmail: to,
-        subject: subject || "",
-        message: message || "",
-      }),
+      payload: JSON.stringify(body),
       muteHttpExceptions: true,
     });
     var code = res.getResponseCode();
@@ -2375,17 +2492,55 @@ function apiEncrypt_(to, subject, message, token) {
       data = JSON.parse(res.getContentText() || "{}");
     } catch (e) {}
     if (code < 200 || code >= 300) {
-      return { ok: false, error: data.error || "Encrypt failed (" + code + ")" };
+      return {
+        ok: false,
+        error: data.error || "Encrypt failed (" + code + ")",
+        code: data.code || "",
+        extension: data.extension || null,
+      };
     }
     return {
       ok: true,
       messageCipherText: data.messageCipherText || "",
+      fileCipherText: data.fileCipherText || null,
       attachment: data.attachment || null,
       mailMetadata: data.mailMetadata || null,
     };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    return { ok: false, error: String(err), code: "" };
   }
+}
+
+/**
+ * Admin blocked extensions (same /public/file-policy as Outlook).
+ */
+function apiFetchBlockedFileExtensions_() {
+  try {
+    var res = UrlFetchApp.fetch(API_BASE + "/public/file-policy", {
+      method: "get",
+      muteHttpExceptions: true,
+    });
+    var code = res.getResponseCode();
+    var data = {};
+    try {
+      data = JSON.parse(res.getContentText() || "{}");
+    } catch (e) {}
+    if (code < 200 || code >= 300) return [];
+    return Array.isArray(data.blockedFileExtensions)
+      ? data.blockedFileExtensions
+      : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+/**
+ * Like Outlook: one encrypt call with file + message.
+ * Server rejects blocked extensions before encrypting anything, and encrypts
+ * the file before the message.
+ */
+function apiEncryptFileThenMessage_(to, subject, message, token, fileOpts) {
+  return apiEncrypt_(to, subject, message || "", token, fileOpts || null);
 }
 
 /**
@@ -2890,6 +3045,194 @@ function extractMessagePlainBody_(payload) {
   return "";
 }
 
+function extensionFromFileName_(fileName) {
+  const base = String(fileName || "").split(/[\\/]/).pop() || "";
+  const dot = base.lastIndexOf(".");
+  if (dot <= 0 || dot === base.length - 1) return "";
+  return base
+    .slice(dot + 1)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function isAlreadyEncryptedName_(fileName) {
+  return /\.secure[a-z0-9]+$/i.test(String(fileName || ""));
+}
+
+function isBlockedFileName_(fileName, blockedList) {
+  const ext = extensionFromFileName_(fileName);
+  if (!ext || !blockedList || !blockedList.length) return false;
+  for (let i = 0; i < blockedList.length; i++) {
+    if (String(blockedList[i] || "").toLowerCase() === ext) return true;
+  }
+  return false;
+}
+
+function findBlockedDraftAttachment_(files, blockedList) {
+  if (!files || !files.length || !blockedList || !blockedList.length) return null;
+  for (let i = 0; i < files.length; i++) {
+    if (isAlreadyEncryptedName_(files[i].name)) continue;
+    if (isBlockedFileName_(files[i].name, blockedList)) return files[i];
+  }
+  return null;
+}
+
+/** First non-encrypted, non-blocked attachment with content (same as Outlook). */
+function pickDraftFileToEncrypt_(files, blockedList) {
+  if (!files || !files.length) return null;
+  for (let i = 0; i < files.length; i++) {
+    if (
+      !isAlreadyEncryptedName_(files[i].name) &&
+      !isBlockedFileName_(files[i].name, blockedList || []) &&
+      files[i].content
+    ) {
+      return files[i];
+    }
+  }
+  return null;
+}
+
+function guessMimeTypeFromName_(fileName) {
+  const ext = extensionFromFileName_(fileName);
+  if (ext === "pdf") return "application/pdf";
+  if (ext === "png") return "image/png";
+  if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+  if (ext === "gif") return "image/gif";
+  if (ext === "webp") return "image/webp";
+  if (ext === "txt") return "text/plain";
+  if (ext === "doc") return "application/msword";
+  if (ext === "docx") {
+    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  }
+  return "application/octet-stream";
+}
+
+function listMimeAttachmentParts_(payload, out) {
+  out = out || [];
+  if (!payload) return out;
+
+  const mime = String(payload.mimeType || "").toLowerCase();
+  let filename = String(payload.filename || "").trim();
+  if (!filename) {
+    const cd = getMimeHeader_(payload.headers || [], "Content-Disposition");
+    const m = /filename\*?=(?:UTF-8''|"?)([^";]+)"?/i.exec(cd || "");
+    if (m && m[1]) {
+      try {
+        filename = decodeURIComponent(String(m[1]).replace(/"/g, "").trim());
+      } catch (e) {
+        filename = String(m[1]).replace(/"/g, "").trim();
+      }
+    }
+  }
+
+  if (filename && mime.indexOf("multipart/") !== 0) {
+    const disposition = String(
+      getMimeHeader_(payload.headers || [], "Content-Disposition") || ""
+    );
+    const isInlineImage =
+      /^inline\b/i.test(disposition) && mime.indexOf("image/") === 0;
+    if (!isInlineImage) {
+      out.push({
+        name: filename,
+        mimeType: mime || "application/octet-stream",
+        attachmentId: (payload.body && payload.body.attachmentId) || "",
+        data: (payload.body && payload.body.data) || "",
+      });
+    }
+  }
+
+  const parts = payload.parts || [];
+  for (let i = 0; i < parts.length; i++) {
+    listMimeAttachmentParts_(parts[i], out);
+  }
+  return out;
+}
+
+function gmailAttachmentDataToBase64_(data) {
+  var s = String(data || "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .replace(/\s+/g, "");
+  var pad = (4 - (s.length % 4)) % 4;
+  if (pad) s += "====".slice(0, pad);
+  return s;
+}
+
+function fetchGmailAttachmentBase64_(messageId, attachmentId, accessToken) {
+  if (!messageId || !attachmentId) return "";
+  const res = gmailApiRequest_(
+    "get",
+    "/gmail/v1/users/me/messages/" +
+      encodeURIComponent(messageId) +
+      "/attachments/" +
+      encodeURIComponent(attachmentId),
+    null,
+    accessToken
+  );
+  if (!res.ok || !res.data || !res.data.data) return "";
+  return gmailAttachmentDataToBase64_(res.data.data);
+}
+
+/**
+ * List draft attachment metadata (names) for blocked-extension checks.
+ * Does not download bytes.
+ */
+function listDraftAttachmentMetas_(payload) {
+  return listMimeAttachmentParts_(payload, []).map(function (p) {
+    return {
+      name: p.name,
+      mimeType: p.mimeType || guessMimeTypeFromName_(p.name),
+      attachmentId: p.attachmentId || "",
+      data: p.data || "",
+      content: null,
+    };
+  });
+}
+
+/** Load clear draft attachments (base64) for encrypt. Fails if a named file cannot be read. */
+function loadDraftEncryptFiles_(messageId, payload, accessToken) {
+  const parts = listMimeAttachmentParts_(payload, []);
+  const files = [];
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    let b64 = "";
+    if (p.data) {
+      b64 = gmailAttachmentDataToBase64_(p.data);
+    } else if (p.attachmentId) {
+      if (!messageId) {
+        throw new Error(
+          "Could not read draft attachment \"" +
+            p.name +
+            "\" (missing message id). Wait for Gmail autosave, then try again."
+        );
+      }
+      b64 = fetchGmailAttachmentBase64_(
+        messageId,
+        p.attachmentId,
+        accessToken
+      );
+      if (!b64) {
+        throw new Error(
+          "Could not download draft attachment \"" +
+            p.name +
+            "\". Wait for Gmail autosave, then try again."
+        );
+      }
+    }
+    if (!b64) {
+      throw new Error(
+        "Draft attachment \"" + p.name + "\" has no content to encrypt."
+      );
+    }
+    files.push({
+      name: p.name,
+      mimeType: p.mimeType || guessMimeTypeFromName_(p.name),
+      content: b64,
+    });
+  }
+  return files;
+}
+
 function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
   const targets = [];
   for (let i = 0; i < (toEmails || []).length; i++) {
@@ -2979,6 +3322,7 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
       body: body,
       ccHeader: getMimeHeader_(headers, "Cc"),
       bccHeader: getMimeHeader_(headers, "Bcc"),
+      payload: payload,
       score: score,
     };
 
@@ -2995,6 +3339,23 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
         "Could not match an open draft. Add a recipient in To, wait for autosave, then try again.",
     };
   }
+
+  try {
+    best.attachmentMetas = listDraftAttachmentMetas_(best.payload);
+    best.files = loadDraftEncryptFiles_(
+      best.messageId,
+      best.payload,
+      accessToken
+    );
+  } catch (loadErr) {
+    return {
+      ok: false,
+      error:
+        (loadErr && loadErr.message) ||
+        "Could not read draft attachments. Wait for Gmail autosave, then try again.",
+    };
+  }
+  delete best.payload;
   return best;
 }
 
@@ -3006,45 +3367,103 @@ function sanitizeMimeHeader_(s) {
 
 function buildRfc822EncryptedMime_(options) {
   options = options || {};
-  const boundary = "SecureDocShareAlt_" + String(Date.now());
-  const lines = [
+  const altBoundary = "SecureDocShareAlt_" + String(Date.now());
+  const attachments = [];
+  if (options.attachmentBase64) {
+    attachments.push({
+      fileName: options.attachmentName || "encrypted.securefile",
+      base64: options.attachmentBase64,
+      mimeType: options.attachmentMimeType || "application/octet-stream",
+    });
+  }
+  const extra = options.attachments || [];
+  for (let a = 0; a < extra.length; a++) {
+    if (extra[a] && extra[a].base64) attachments.push(extra[a]);
+  }
+
+  const headerLines = [
     "To: " + sanitizeMimeHeader_(options.to),
     "Subject: " + sanitizeMimeHeader_(options.subject || "Secure document"),
     "MIME-Version: 1.0",
-    'Content-Type: multipart/alternative; boundary="' + boundary + '"',
-    "",
-    "--" + boundary,
-    "Content-Type: text/plain; charset=UTF-8",
-    "",
-    options.text || "",
-    "",
-    "--" + boundary,
-    "Content-Type: text/html; charset=UTF-8",
-    "",
-    options.html || "",
-    "",
-    "--" + boundary + "--",
-    "",
   ];
-  if (options.cc) lines.splice(1, 0, "Cc: " + sanitizeMimeHeader_(options.cc));
+  if (options.cc) headerLines.splice(1, 0, "Cc: " + sanitizeMimeHeader_(options.cc));
   if (options.bcc) {
-    lines.splice(
+    headerLines.splice(
       options.cc ? 2 : 1,
       0,
       "Bcc: " + sanitizeMimeHeader_(options.bcc)
     );
   }
   if (options.from) {
-    lines.unshift("From: " + sanitizeMimeHeader_(options.from));
+    headerLines.unshift("From: " + sanitizeMimeHeader_(options.from));
   }
+
+  const altParts = [
+    "--" + altBoundary,
+    "Content-Type: text/plain; charset=UTF-8",
+    "",
+    options.text || "",
+    "",
+    "--" + altBoundary,
+    "Content-Type: text/html; charset=UTF-8",
+    "",
+    options.html || "",
+    "",
+    "--" + altBoundary + "--",
+  ];
+
+  if (!attachments.length) {
+    return headerLines
+      .concat([
+        'Content-Type: multipart/alternative; boundary="' + altBoundary + '"',
+        "",
+      ])
+      .concat(altParts)
+      .concat([""])
+      .join("\r\n");
+  }
+
+  const mixedBoundary = "SecureDocShareMixed_" + String(Date.now());
+  const lines = headerLines.concat([
+    'Content-Type: multipart/mixed; boundary="' + mixedBoundary + '"',
+    "",
+    "--" + mixedBoundary,
+    'Content-Type: multipart/alternative; boundary="' + altBoundary + '"',
+    "",
+  ]);
+  for (let i = 0; i < altParts.length; i++) lines.push(altParts[i]);
+
+  for (let j = 0; j < attachments.length; j++) {
+    const att = attachments[j];
+    const safeName = sanitizeMimeHeader_(
+      att.fileName || "encrypted.securefile"
+    ).replace(/"/g, "");
+    const b64 = String(att.base64 || "").replace(/\s+/g, "");
+    const chunked = b64.replace(/(.{76})/g, "$1\r\n");
+    lines.push("");
+    lines.push("--" + mixedBoundary);
+    lines.push(
+      "Content-Type: " +
+        (att.mimeType || "application/octet-stream") +
+        '; name="' +
+        safeName +
+        '"'
+    );
+    lines.push("Content-Transfer-Encoding: base64");
+    lines.push('Content-Disposition: attachment; filename="' + safeName + '"');
+    lines.push("");
+    lines.push(chunked.replace(/\r\n$/, ""));
+  }
+  lines.push("");
+  lines.push("--" + mixedBoundary + "--");
+  lines.push("");
   return lines.join("\r\n");
 }
 
 function encodeRawMime_(rfc822) {
-  return Utilities.base64EncodeWebSafe(rfc822, Utilities.Charset.UTF_8).replace(
-    /=+$/,
-    ""
-  );
+  // Encode raw MIME bytes (ASCII). Avoid Charset.UTF_8 path — more reliable for large attachments.
+  const bytes = Utilities.newBlob(String(rfc822 || "")).getBytes();
+  return Utilities.base64EncodeWebSafe(bytes).replace(/=+$/, "");
 }
 
 /** Create a draft with recipient, subject, and encrypted body. */

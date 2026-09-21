@@ -209,17 +209,24 @@ function apiGetSubscription_(token) {
   }
 }
 
-function apiEncrypt_(to, subject, message, token) {
+function apiEncrypt_(to, subject, message, token, fileOpts) {
+  fileOpts = fileOpts || {};
   try {
+    var body = {
+      recipientEmail: to,
+      subject: subject || "",
+      message: message || "",
+    };
+    if (fileOpts.fileBase64) {
+      body.fileBase64 = fileOpts.fileBase64;
+      body.fileName = fileOpts.fileName || "document.bin";
+      body.mimeType = fileOpts.mimeType || "application/octet-stream";
+    }
     var res = UrlFetchApp.fetch(API_BASE + "/files/encrypt", {
       method: "post",
       contentType: "application/json",
       headers: { Authorization: "Bearer " + token },
-      payload: JSON.stringify({
-        recipientEmail: to,
-        subject: subject || "",
-        message: message || "",
-      }),
+      payload: JSON.stringify(body),
       muteHttpExceptions: true,
     });
     var code = res.getResponseCode();
@@ -228,17 +235,55 @@ function apiEncrypt_(to, subject, message, token) {
       data = JSON.parse(res.getContentText() || "{}");
     } catch (e) {}
     if (code < 200 || code >= 300) {
-      return { ok: false, error: data.error || "Encrypt failed (" + code + ")" };
+      return {
+        ok: false,
+        error: data.error || "Encrypt failed (" + code + ")",
+        code: data.code || "",
+        extension: data.extension || null,
+      };
     }
     return {
       ok: true,
       messageCipherText: data.messageCipherText || "",
+      fileCipherText: data.fileCipherText || null,
       attachment: data.attachment || null,
       mailMetadata: data.mailMetadata || null,
     };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    return { ok: false, error: String(err), code: "" };
   }
+}
+
+/**
+ * Admin blocked extensions (same /public/file-policy as Outlook).
+ */
+function apiFetchBlockedFileExtensions_() {
+  try {
+    var res = UrlFetchApp.fetch(API_BASE + "/public/file-policy", {
+      method: "get",
+      muteHttpExceptions: true,
+    });
+    var code = res.getResponseCode();
+    var data = {};
+    try {
+      data = JSON.parse(res.getContentText() || "{}");
+    } catch (e) {}
+    if (code < 200 || code >= 300) return [];
+    return Array.isArray(data.blockedFileExtensions)
+      ? data.blockedFileExtensions
+      : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+/**
+ * Like Outlook: one encrypt call with file + message.
+ * Server rejects blocked extensions before encrypting anything, and encrypts
+ * the file before the message.
+ */
+function apiEncryptFileThenMessage_(to, subject, message, token, fileOpts) {
+  return apiEncrypt_(to, subject, message || "", token, fileOpts || null);
 }
 
 /**

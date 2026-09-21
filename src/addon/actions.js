@@ -390,6 +390,10 @@ function resolveComposeEncryptPayload_(e, gmailAccessToken) {
     subject: subject,
     message: message,
     matched: matched,
+    files:
+      matched && matched.ok && Array.isArray(matched.files)
+        ? matched.files
+        : [],
   };
 }
 
@@ -417,6 +421,16 @@ function runComposeEncryptAndSendCore_(e) {
 
   var accessToken = tokenRes.accessToken;
   var payload = resolveComposeEncryptPayload_(e, accessToken);
+  if (
+    payload.matched &&
+    payload.matched.ok === false &&
+    payload.matched.error
+  ) {
+    return {
+      ok: false,
+      error: payload.matched.error,
+    };
+  }
   if (!payload.firstTo) {
     return {
       ok: false,
@@ -424,12 +438,44 @@ function runComposeEncryptAndSendCore_(e) {
         "Add a recipient in To, wait for Gmail autosave, then try again.",
     };
   }
-  if (!String(payload.message || "").trim()) {
+
+  var draftFiles = payload.files || [];
+  var blockedExts =
+    typeof apiFetchBlockedFileExtensions_ === "function"
+      ? apiFetchBlockedFileExtensions_()
+      : [];
+  var blockedAtt =
+    typeof findBlockedDraftAttachment_ === "function"
+      ? findBlockedDraftAttachment_(draftFiles, blockedExts)
+      : null;
+
+  // Same as Outlook: blocked extension → error, do not encrypt message/file.
+  if (blockedAtt) {
+    var blockedExt =
+      (typeof extensionFromFileName_ === "function"
+        ? extensionFromFileName_(blockedAtt.name)
+        : "") || "file";
+    return {
+      ok: false,
+      code: "FILE_EXTENSION_BLOCKED",
+      error:
+        "." +
+        blockedExt +
+        " [blocked extension] is blocked in this app. Nothing was encrypted. Remove the file, then try again.",
+    };
+  }
+
+  var fileToEncrypt =
+    typeof pickDraftFileToEncrypt_ === "function"
+      ? pickDraftFileToEncrypt_(draftFiles, blockedExts)
+      : null;
+
+  if (!String(payload.message || "").trim() && !fileToEncrypt) {
     return {
       ok: false,
       error:
         (payload.matched && payload.matched.error) ||
-        "No draft body found. Type your message, wait for autosave, then try again.",
+        "No draft body or attachment found. Add a message or file, wait for autosave, then try again.",
     };
   }
 
@@ -438,7 +484,7 @@ function runComposeEncryptAndSendCore_(e) {
   // - Strip old sdmeta (avoid duplicate / glued "testsdmeta")
   // - Pure forward / empty new body: re-encrypt decrypted plain for the NEW To
   // - Reply with new text: encrypt only the new text; append clear parent (no old meta)
-  var split = splitComposeNewAndQuoted_(payload.message);
+  var split = splitComposeNewAndQuoted_(payload.message || "");
   var newMessage = String(split.newText || "").trim();
   var quotedBlock = String(split.quotedBlock || "").trim();
   var sessionEmail =
@@ -512,21 +558,61 @@ function runComposeEncryptAndSendCore_(e) {
     }
   }
 
-  if (!String(messageToEncrypt || "").trim()) {
+  if (!String(messageToEncrypt || "").trim() && !fileToEncrypt) {
     return {
       ok: false,
       error:
-        "Nothing to encrypt. Add a message, or forward an encrypted mail you can decrypt.",
+        "Nothing to encrypt. Add a message or file, or forward an encrypted mail you can decrypt.",
     };
   }
 
-  var enc = apiEncrypt_(
-    payload.firstTo,
-    subject,
-    messageToEncrypt,
-    gate.token
-  );
+  var fileOpts = null;
+  if (fileToEncrypt && fileToEncrypt.content) {
+    fileOpts = {
+      fileBase64: fileToEncrypt.content,
+      fileName: fileToEncrypt.name || "document.bin",
+      mimeType:
+        fileToEncrypt.mimeType ||
+        (typeof guessMimeTypeFromName_ === "function"
+          ? guessMimeTypeFromName_(fileToEncrypt.name)
+          : "application/octet-stream"),
+    };
+  }
+
+  // Valid file first (if any), then message — same order as Outlook.
+  var enc =
+    typeof apiEncryptFileThenMessage_ === "function"
+      ? apiEncryptFileThenMessage_(
+          payload.firstTo,
+          subject,
+          messageToEncrypt || "",
+          gate.token,
+          fileOpts
+        )
+      : apiEncrypt_(
+          payload.firstTo,
+          subject,
+          messageToEncrypt || "",
+          gate.token,
+          fileOpts
+        );
   if (!enc.ok) {
+    if (enc.code === "FILE_EXTENSION_BLOCKED") {
+      var failExt =
+        enc.extension ||
+        (fileOpts && fileOpts.fileName
+          ? extensionFromFileName_(fileOpts.fileName)
+          : "file");
+      return {
+        ok: false,
+        code: "FILE_EXTENSION_BLOCKED",
+        error:
+          enc.error ||
+          "." +
+            failExt +
+            " [blocked extension] is blocked. Nothing was encrypted. Remove the file, then try again.",
+      };
+    }
     return { ok: false, error: enc.error || "Encrypt failed." };
   }
 
@@ -537,6 +623,32 @@ function runComposeEncryptAndSendCore_(e) {
   var toHeader = payload.toJoined || payload.firstTo;
   var oldDraftId =
     payload.matched && payload.matched.ok ? payload.matched.draftId || "" : "";
+
+  var encAtt = enc.attachment || null;
+  var encAttB64 =
+    (encAtt && (encAtt.attachmentBase64 || encAtt.base64)) ||
+    enc.fileCipherText ||
+    null;
+  var encAttName =
+    (encAtt && encAtt.fileName) ||
+    (fileToEncrypt && fileToEncrypt.name
+      ? String(fileToEncrypt.name).replace(/\.[^.]+$/, "") + ".securefile"
+      : "encrypted.securefile");
+
+  if (fileToEncrypt && !encAttB64) {
+    return {
+      ok: false,
+      error:
+        "File was encrypted on the server but no secure attachment was returned. Try a smaller PDF, then send again.",
+    };
+  }
+
+  if (!cipher && !encAttB64) {
+    return {
+      ok: false,
+      error: "Encrypt returned no message and no file. Nothing was sent.",
+    };
+  }
 
   var mimeOpts = {
     from: tokenRes.from || "",
@@ -552,6 +664,8 @@ function runComposeEncryptAndSendCore_(e) {
     subject: subject,
     html: bodyHtml,
     text: bodyText,
+    attachmentName: encAttB64 ? encAttName : "",
+    attachmentBase64: encAttB64 || "",
   };
 
   // 1) Create encrypted draft → 2) send → 3) delete plaintext draft

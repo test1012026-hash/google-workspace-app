@@ -1,1113 +1,132 @@
-const ADMIN_URL = "https://admin-panel-amber-nine.vercel.app";
-const API_BASE = "https://server-nine-rosy.vercel.app/api";
-const APP_ORIGIN = API_BASE.replace(/\/api\/?$/, "");
-const SESSION_KEY = "SDS_WORKSPACE_SESSION";
-const WEB_APP_DEPLOYMENT_ID =
-  "AKfycbzCvUVD8GnLvsGNpux6euGd2WJrYUmGXEE3qp-NK-emFZSFAvN5dPOkIumQLmgcm5RRVA";
-const WEB_APP_URL =
-  "https://script.google.com/macros/s/" + WEB_APP_DEPLOYMENT_ID + "/exec";
+<script>
+const DEFAULT_API_BASE =
+  typeof SecureDocConfig !== "undefined" && SecureDocConfig.getApiBaseUrl
+    ? SecureDocConfig.getApiBaseUrl()
+    : "";
+const LOGIN_WEB_URL =
+  typeof SecureDocConfig !== "undefined" && SecureDocConfig.getLoginWebUrl
+    ? SecureDocConfig.getLoginWebUrl()
+    : "";
+const SESSION_STORAGE_KEY =
+  typeof SecureDocConfig !== "undefined" &&
+  SecureDocConfig.getSessionStorageKey
+    ? SecureDocConfig.getSessionStorageKey()
+    : "securedoc_workspace_session";
 
-/**
- * From server/.env GOOGLE_GMAIL_* — Workspace Google login (Apps Script OAuth2).
- * Prefer Script Properties via configureGoogleOAuthCredentials(); these are fallbacks.
- */
-const GOOGLE_OAUTH_CLIENT_ID =
-  "387608086587-s1h4da154kpbupqdbmghup6k87e3gp0b.apps.googleusercontent.com";
-const GOOGLE_OAUTH_CLIENT_SECRET = "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";
+function normalizeBaseUrl(url) {
+  let raw = String(
+    url ||
+      (typeof SecureDocConfig !== "undefined" &&
+        SecureDocConfig.getApiBaseUrl &&
+        SecureDocConfig.getApiBaseUrl()) ||
+      DEFAULT_API_BASE
+  ).replace(/\/$/, "");
 
-/** OpenID + Gmail offline scopes (refresh token stored in SecureDocShare DB). */
-const GOOGLE_OAUTH_SCOPES = [
-  "openid",
-  "email",
-  "profile",
-  "https://www.googleapis.com/auth/gmail.send",
-  "https://www.googleapis.com/auth/gmail.readonly",
-  "https://www.googleapis.com/auth/gmail.compose",
-];
+  if (
+    typeof SecureDocConfig !== "undefined" &&
+    typeof SecureDocConfig.ensureApiBase === "function"
+  ) {
+    return SecureDocConfig.ensureApiBase(raw);
+  }
 
-function onHomepage(e) {
-  return buildMainCard_(e);
+  if (!raw) {
+    return typeof SecureDocConfig !== "undefined" && SecureDocConfig.ENV
+      ? SecureDocConfig.ensureApiBase(SecureDocConfig.ENV.API_BASE_URL)
+      : "";
+  }
+  if (/\/api$/i.test(raw)) return raw;
+  return raw + "/api";
 }
 
-function onGmailHomepage(e) {
-  return buildMainCard_(e);
-}
-
-function onGmailMessage(e) {
-  return buildGmailMessageCard_(e);
-}
-
-function onGmailCompose(e) {
-  return buildComposeDirectCard_(e);
-}
-
-/**
- * Workspace Google login via Apps Script OAuth2 library (OpenID Connect).
- * Flow: Continue with Google → Google consent → authCallback → verify id_token
- * on SecureDocShare API → store JWT session + Gmail refresh token in DB.
- *
- * Redirect URI (add in Google Cloud OAuth client):
- *   https://script.google.com/macros/d/<SCRIPT_ID>/usercallback
- * Call getGoogleOAuthRedirectUri() in the Apps Script editor to copy it.
- *
- * Requires library: OAuth2
- *   (1B7FSrk5Zi6L1rSxxTDgDEUsPzlukDsi4KGuTMorsTQHhGBzBkMun4iDF)
- */
-
-var GOOGLE_OAUTH_INTENT_KEY = "SDS_GOOGLE_OAUTH_INTENT";
-
-/** Same web client as server GOOGLE_GMAIL_* (identity + Gmail offline). */
-function getGoogleOAuthClientId_() {
-  var fromProps = PropertiesService.getScriptProperties().getProperty(
-    "GOOGLE_OAUTH_CLIENT_ID"
-  );
-  if (fromProps) return String(fromProps).trim();
-  return String(GOOGLE_OAUTH_CLIENT_ID || "").trim();
-}
-
-function getGoogleOAuthClientSecret_() {
-  var fromProps = PropertiesService.getScriptProperties().getProperty(
-    "GOOGLE_OAUTH_CLIENT_SECRET"
-  );
-  if (fromProps) return String(fromProps).trim();
-  return String(GOOGLE_OAUTH_CLIENT_SECRET || "").trim();
-}
-
-/** One-time: copy env values into Script Properties (run from editor). */
-function configureGoogleOAuthCredentials() {
-  var props = PropertiesService.getScriptProperties();
-  props.setProperty("GOOGLE_OAUTH_CLIENT_ID", getGoogleOAuthClientId_());
-  props.setProperty("GOOGLE_OAUTH_CLIENT_SECRET", getGoogleOAuthClientSecret_());
+function failure(status, data, fallbackError) {
+  data = data || {};
   return {
-    ok: true,
-    clientId: getGoogleOAuthClientId_(),
-    redirectUri: getGoogleOAuthRedirectUri(),
+    ok: false,
+    status: status,
+    error: data.error || data.message || fallbackError || "Request failed",
+    code: data.code || null,
+    data: data,
+    subscriptionActive: data.subscriptionActive === true,
   };
 }
 
-function getGoogleOAuthRedirectUri() {
-  return (
-    "https://script.google.com/macros/d/" +
-    ScriptApp.getScriptId() +
-    "/usercallback"
-  );
-}
-
-function getGoogleOAuthService_() {
-  var clientId = getGoogleOAuthClientId_();
-  var clientSecret = getGoogleOAuthClientSecret_();
-  if (!clientId || !clientSecret) {
-    throw new Error(
-      "Google OAuth client id/secret missing. Run configureGoogleOAuthCredentials()."
-    );
+function success(status, data) {
+  data = data || {};
+  const out = {
+    ok: true,
+    status: status,
+    error: null,
+    code: null,
+    data: data,
+  };
+  for (const key in data) {
+    if (Object.prototype.hasOwnProperty.call(data, key)) {
+      out[key] = data[key];
+    }
   }
-  if (typeof OAuth2 === "undefined" || !OAuth2.createService) {
-    throw new Error(
-      "OAuth2 library missing. Add library 1B7FSrk5Zi6L1rSxxTDgDEUsPzlukDsi4KGuTMorsTQHhGBzBkMun4iDF"
-    );
-  }
-
-  return OAuth2.createService("securedoc_google")
-    .setAuthorizationBaseUrl("https://accounts.google.com/o/oauth2/v2/auth")
-    .setTokenUrl("https://oauth2.googleapis.com/token")
-    .setClientId(clientId)
-    .setClientSecret(clientSecret)
-    .setCallbackFunction("authCallback")
-    .setPropertyStore(PropertiesService.getUserProperties())
-    .setScope(GOOGLE_OAUTH_SCOPES.join(" "))
-    .setParam("access_type", "offline")
-    .setParam("prompt", "consent")
-    .setParam("include_granted_scopes", "true");
+  return out;
 }
 
-function saveGoogleOAuthIntent_(intent, acceptTerms) {
-  PropertiesService.getUserProperties().setProperty(
-    GOOGLE_OAUTH_INTENT_KEY,
-    JSON.stringify({
-      intent: intent === "signup" ? "signup" : "login",
-      acceptTerms: Boolean(acceptTerms),
-    })
-  );
-}
-
-function loadGoogleOAuthIntent_() {
+function parseJsonText(text, statusText) {
   try {
-    var raw = PropertiesService.getUserProperties().getProperty(
-      GOOGLE_OAUTH_INTENT_KEY
-    );
-    if (!raw) return { intent: "login", acceptTerms: false };
-    var parsed = JSON.parse(raw);
-    return {
-      intent: parsed.intent === "signup" ? "signup" : "login",
-      acceptTerms: Boolean(parsed.acceptTerms),
-    };
+    return text ? JSON.parse(text) : null;
   } catch (e) {
-    return { intent: "login", acceptTerms: false };
+    return { error: text || statusText || "Invalid JSON response" };
   }
 }
 
-/**
- * Start Google login/signup. Returns authorization URL for OpenLink / top redirect.
- * @param {{intent?: string, acceptTerms?: boolean}|string=} options
- */
-function getGoogleLoginUrl(options) {
+function resolveApiUrl(baseUrl, path) {
+  let base = normalizeBaseUrl(baseUrl);
+  let p = String(path || "");
+  if (p.charAt(0) !== "/") p = "/" + p;
+  if (!/\/api$/i.test(base)) {
+    base = String(base || "").replace(/\/$/, "") + "/api";
+  }
+  return base + p;
+}
+
+function apiRequest(baseUrl, path, options) {
   options = options || {};
-  if (typeof options === "string") {
-    options = { intent: options };
+  const headers = { Accept: "application/json" };
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
   }
-  var intent = options.intent === "signup" ? "signup" : "login";
-  var acceptTerms = options.acceptTerms === true || intent === "signup";
-  if (intent === "signup" && !acceptTerms) {
-    throw new Error("Accept Terms & Conditions to sign up with Google.");
-  }
-  saveGoogleOAuthIntent_(intent, acceptTerms);
-
-  var service = getGoogleOAuthService_();
-  // Always re-consent so we can capture refresh token for Gmail send when missing.
-  return service.getAuthorizationUrl();
-}
-
-/**
- * OAuth2 library callback — Google verified identity, then our DB session.
- */
-function authCallback(request) {
-  var service = getGoogleOAuthService_();
-  var ok = false;
-  try {
-    ok = service.handleCallback(request);
-  } catch (err) {
-    return googleOAuthResultPage_(false, String(err.message || err));
-  }
-  if (!ok) {
-    return googleOAuthResultPage_(false, "Google authentication failed.");
+  if (options.token) {
+    headers.Authorization = "Bearer " + options.token;
   }
 
-  var idToken = "";
-  try {
-    if (typeof service.getIdToken === "function") {
-      idToken = String(service.getIdToken() || "");
-    }
-  } catch (e0) {}
-  if (!idToken) {
-    try {
-      var tok = service.getToken();
-      idToken = String((tok && tok.id_token) || "");
-    } catch (e1) {}
-  }
-  if (!idToken) {
-    return googleOAuthResultPage_(
-      false,
-      "Google did not return an id_token. Ensure openid scope is granted."
-    );
-  }
-
-  var refreshToken = "";
-  var scope = "";
-  try {
-    var tokenBag = service.getToken();
-    refreshToken = String((tokenBag && tokenBag.refresh_token) || "");
-    scope = String((tokenBag && tokenBag.scope) || GOOGLE_OAUTH_SCOPES.join(" "));
-  } catch (e2) {}
-
-  // Extra identity check against OpenID userinfo (not browser-supplied email).
-  try {
-    var access = service.getAccessToken();
-    if (access) {
-      var infoRes = UrlFetchApp.fetch(
-        "https://openidconnect.googleapis.com/v1/userinfo",
-        {
-          headers: { Authorization: "Bearer " + access },
-          muteHttpExceptions: true,
-        }
-      );
-      if (infoRes.getResponseCode() >= 200 && infoRes.getResponseCode() < 300) {
-        var info = JSON.parse(infoRes.getContentText() || "{}");
-        if (info.email_verified === false) {
-          return googleOAuthResultPage_(false, "Google email is not verified.");
-        }
-      }
-    }
-  } catch (e3) {}
-
-  var intentState = loadGoogleOAuthIntent_();
-  var login = apiLoginGoogle_({
-    idToken: idToken,
-    gmailRefreshToken: refreshToken || null,
-    gmailScopes: scope,
-    intent: intentState.intent,
-    acceptTerms: intentState.acceptTerms,
+  return fetch(resolveApiUrl(baseUrl, path), {
+    method: options.method || "GET",
+    headers: headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  }).then(function (res) {
+    return res.text().then(function (text) {
+      return {
+        res: res,
+        data: parseJsonText(text, res.statusText),
+      };
+    });
   });
+}
 
-  if (!login.ok) {
-    return googleOAuthResultPage_(false, login.error || "Sign-in failed");
+;
+function getLoginWebUrl() {
+  if (typeof SecureDocConfig !== "undefined" && SecureDocConfig.getLoginWebUrl) {
+    return SecureDocConfig.getLoginWebUrl();
   }
+  return LOGIN_WEB_URL;
+}
 
-  saveWorkspaceSession({
-    token: login.token,
-    email: login.email,
-    expiresAt: login.expiresAt || null,
-  });
+function loginRequiredMessage(extra) {
+  let base = "Login required. Sign in with SecureDocShare, then try again.";
+  if (extra) base = String(extra) + " " + base;
+  return base;
+}
 
+function readSessionFromLocal() {
   try {
-    PropertiesService.getUserProperties().deleteProperty(GOOGLE_OAUTH_INTENT_KEY);
-  } catch (e4) {}
-
-  // Land on the Workspace web app (not script.google.com/home).
-  var appUrl = String(WEB_APP_URL || "").split("?")[0];
-  if (appUrl) {
-    return HtmlService.createHtmlOutput(
-      "<!DOCTYPE html><html><body style='font-family:system-ui,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
-        "<p style='font-size:18px;font-weight:700'>SecureDocShare</p>" +
-        "<p style='color:#2bb3a0'>Signed in as " +
-        escapeHtml_(login.email || "user") +
-        "</p>" +
-        "<p style='color:#9db4bd'>Please go back to Gmail and refresh the page to continue.</p>" +
-        "<script>window.top.location.replace(" +
-        JSON.stringify(appUrl) +
-        ");</script>" +
-        "<p><a style='color:#2bb3a0' href='" +
-        escapeHtml_(appUrl) +
-        "'>Continue</a></p>" +
-        "</body></html>"
-    ).setTitle("Signed in");
-  }
-
-  return googleOAuthResultPage_(true, login.email || "Signed in");
-}
-
-function googleOAuthResultPage_(success, detail) {
-  var title = success ? "Signed in" : "Sign-in failed";
-  var color = success ? "#2bb3a0" : "#ff6b7a";
-  var msg = success
-    ? "Signed in as " + escapeHtml_(detail) + ". Close this window and return to Gmail."
-    : escapeHtml_(detail);
-  return HtmlService.createHtmlOutput(
-    "<!DOCTYPE html><html><body style='font-family:system-ui,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
-      "<p style='font-size:18px;font-weight:700'>SecureDocShare</p>" +
-      "<h2 style='color:" +
-      color +
-      "'>" +
-      title +
-      "</h2>" +
-      "<p>" +
-      msg +
-      "</p>" +
-      "<script>setTimeout(function(){try{window.close();}catch(e){}},1200);</script>" +
-      "</body></html>"
-  ).setTitle(title);
-}
-
-function cardHeader_(title, subtitle) {
-  return CardService.newCardHeader()
-    .setTitle(title || "SecureDocShare")
-    .setSubtitle(subtitle || "Encrypt · Decrypt · Secure mail");
-}
-
-function statusRow_(text, ok) {
-  return CardService.newDecoratedText()
-    .setText(String(text || ""))
-    .setWrapText(true)
-    .setStartIcon(
-      CardService.newIconImage().setIconUrl(
-        ok
-          ? "https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/check_circle/default/24px.svg"
-          : "https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/error/default/24px.svg"
-      )
-    );
-}
-
-function infoRow_(title, text) {
-  return CardService.newDecoratedText()
-    .setTopLabel(String(title || ""))
-    .setText(String(text || ""))
-    .setWrapText(true)
-    .setStartIcon(
-      CardService.newIconImage().setIconUrl(
-        "https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/info/default/24px.svg"
-      )
-    );
-}
-
-function primaryBtn_(label, fnName) {
-  return CardService.newTextButton()
-    .setText(label)
-    .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-    .setOnClickAction(CardService.newAction().setFunctionName(fnName));
-}
-
-function secondaryBtn_(label, fnName) {
-  return CardService.newTextButton()
-    .setText(label)
-    .setOnClickAction(CardService.newAction().setFunctionName(fnName));
-}
-
-/** Valid session or null (clears expired tokens → login screen). */
-function getValidWorkspaceAuth_() {
-  var session = getWorkspaceSession_();
-  if (!session || !session.token) return null;
-  var auth = apiGetSubscription_(session.token);
-  if (!auth || !auth.ok) {
-    clearWorkspaceSession();
-    return null;
-  }
-  return { session: session, auth: auth };
-}
-
-function buildGmailMessageCard_(e) {
-  var valid = getValidWorkspaceAuth_();
-  var scan = scanMessageForSecureDoc_(e);
-  var hasSecure =
-    Boolean(scan.cipher) || (scan.attachments && scan.attachments.length > 0);
-
-  if (!valid) {
-    var card = CardService.newCardBuilder().setHeader(
-      cardHeader_(
-        "SecureDocShare",
-        hasSecure ? "Encrypted mail — sign in" : "Sign in"
-      )
-    );
-    if (hasSecure) {
-      card.addSection(
-        CardService.newCardSection()
-          .addWidget(
-            statusRow_(
-              "This mail has SecureDoc content (sds. and/or encrypted file).",
-              true
-            )
-          )
-          .addWidget(
-            infoRow_("Next step", "Sign in below to decrypt and download.")
-          )
-      );
-    }
-    card.addSection(buildLoginSection_(e));
-    card.addSection(buildLinksSection_());
-    return card.build();
-  }
-
-  if (hasSecure) {
-    return buildAutoDecryptCard_(e, valid.session, scan);
-  }
-
-  return buildMainCard_(e);
-}
-
-/** Side panel: login screen OR tools (never tools without auth). */
-function buildMainCard_(e) {
-  var valid = getValidWorkspaceAuth_();
-
-  if (!valid) {
-    return CardService.newCardBuilder()
-      .setHeader(cardHeader_("SecureDocShare", "Sign in"))
-      .addSection(buildLoginSection_(e))
-      .addSection(buildLinksSection_())
-      .build();
-  }
-
-  var card = CardService.newCardBuilder().setHeader(
-    cardHeader_("SecureDocShare", "Ready")
-  );
-  card.addSection(buildSignedInSection_(valid.session, valid.auth));
-  card.addSection(buildDecryptSection_(e));
-  card.addSection(buildLinksSection_());
-  return card.build();
-}
-
-function getCardAuthMode_(e) {
-  var params = (e && e.parameters) || {};
-  var form = (e && e.formInput) || {};
-  if (params.authMode === "signup" || form.auth_mode === "signup") {
-    return "signup";
-  }
-  var stored = PropertiesService.getUserProperties().getProperty(
-    "SDS_CARD_AUTH_MODE"
-  );
-  return stored === "signup" ? "signup" : "login";
-}
-
-function setCardAuthMode_(mode) {
-  PropertiesService.getUserProperties().setProperty(
-    "SDS_CARD_AUTH_MODE",
-    mode === "signup" ? "signup" : "login"
-  );
-}
-
-/**
- * Account section — login / signup options:
-
- * Log in / Sign up, email+password, OTP on signup, Continue with Google.
- */
-function buildLoginSection_(e) {
-  var mode = getCardAuthMode_(e);
-  var isSignup = mode === "signup";
-  var otpSent =
-    PropertiesService.getUserProperties().getProperty("SDS_CARD_OTP_SENT") ===
-    "1";
-  var draft = typeof loadCardSignupDraft_ === "function" ? loadCardSignupDraft_() : null;
-  var draftEmail = draft && draft.email ? String(draft.email) : "";
-  var draftPassword = draft && draft.password ? String(draft.password) : "";
-  var draftTerms = Boolean(draft && draft.acceptTerms === true);
-
-  var section = CardService.newCardSection().setHeader("Account");
-
-  section.addWidget(
-    CardService.newTextParagraph().setText(
-      isSignup ? "<b>Sign up</b>" : "<b>Log in</b>"
-    )
-  );
-
-  var emailInput = CardService.newTextInput()
-    .setFieldName("login_email")
-    .setTitle("Email")
-    .setHint("you@company.com");
-  if (isSignup && draftEmail) emailInput.setValue(draftEmail);
-
-  var passwordInput = CardService.newTextInput()
-    .setFieldName("login_password")
-    .setTitle("Password");
-  if (isSignup && draftPassword) passwordInput.setValue(draftPassword);
-
-  section.addWidget(emailInput).addWidget(passwordInput);
-
-  if (isSignup) {
-    section.addWidget(
-      CardService.newSelectionInput()
-        .setType(CardService.SelectionInputType.CHECK_BOX)
-        .setFieldName("accept_terms")
-        .addItem("I agree to the Terms & Conditions", "yes", draftTerms)
-    );
-  }
-
-  if (isSignup && otpSent) {
-    section.addWidget(
-      CardService.newTextInput()
-        .setFieldName("signup_otp")
-        .setTitle("4-digit verification code")
-        .setHint("••••")
-    );
-    section.addWidget(
-      CardService.newButtonSet().addButton(
-        secondaryBtn_("Resend code", "onCardResendOtp_")
-      )
-    );
-  }
-
-  var primaryLabel = isSignup
-    ? otpSent
-      ? "Verify & sign up"
-      : "Send verification code"
-    : "Log in";
-
-  section.addWidget(
-    CardService.newButtonSet().addButton(
-      primaryBtn_(primaryLabel, "onCardLogin_")
-    )
-  );
-
-  section.addWidget(
-    CardService.newButtonSet().addButton(
-      CardService.newTextButton()
-        .setText("Continue with Google")
-        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-        .setOnClickAction(
-          CardService.newAction().setFunctionName("onCardGoogleSignIn_")
-        )
-    )
-  );
-
-  section.addWidget(
-    CardService.newButtonSet().addButton(
-      CardService.newTextButton()
-        .setText(
-          isSignup
-            ? "Already have an account? Log in"
-            : "Need an account? Sign up"
-        )
-        .setOnClickAction(
-          CardService.newAction()
-            .setFunctionName("onCardToggleAuthMode_")
-            .setParameters({ authMode: isSignup ? "login" : "signup" })
-        )
-    )
-  );
-
- 
-
-  return section;
-}
-
-function buildSignedInSection_(session, prefetchedAuth) {
-  var subLine = "Checking subscription…";
-  var check =
-    prefetchedAuth && typeof prefetchedAuth.ok === "boolean"
-      ? prefetchedAuth
-      : apiGetSubscription_(session.token);
-  var ok = false;
-  if (check.ok) {
-    ok = Boolean(check.subscriptionActive);
-    subLine = ok ? "Subscription active" : "Subscription inactive";
-  }
-
-  return CardService.newCardSection()
-    .setHeader("Account")
-    .addWidget(
-      CardService.newDecoratedText()
-        .setTopLabel("Signed in")
-        .setText(String(session.email || "user"))
-        .setBottomLabel(subLine)
-        .setWrapText(true)
-        .setStartIcon(
-          CardService.newIconImage().setIconUrl(
-            ok
-              ? "https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/verified_user/default/24px.svg"
-              : "https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/person/default/24px.svg"
-          )
-        )
-    )
-    .addWidget(
-      CardService.newButtonSet()
-        .addButton(secondaryBtn_("Refresh", "onCardBack_"))
-        .addButton(secondaryBtn_("Sign out", "onCardLogout_"))
-    );
-}
-
-function buildDecryptSection_(e) {
-  var detected = "";
-  var scan = { cipher: "", attachments: [] };
-  try {
-    scan = scanMessageForSecureDoc_(e) || scan;
-    detected = scan.cipher || "";
-  } catch (err) {
-    detected = "";
-  }
-
-  var section = CardService.newCardSection()
-    .setHeader("Decrypt")
-    .setCollapsible(true)
-    .setNumUncollapsibleWidgets(1);
-
-  if (detected) {
-    section.addWidget(
-      statusRow_("Encrypted sds. message detected in this mail.", true)
-    );
-  } else {
-    section.addWidget(
-      infoRow_(
-        "Manual decrypt",
-        "Paste an sds. token, or open an encrypted mail for auto-decrypt."
-      )
-    );
-  }
-
-  section
-    .addWidget(
-      CardService.newTextInput()
-        .setFieldName("decrypt_cipher")
-        .setTitle("Message ciphertext")
-        .setMultiline(true)
-        .setValue(detected || "")
-    )
-    .addWidget(
-      CardService.newButtonSet().addButton(
-        primaryBtn_("Decrypt message", "onCardDecrypt_")
-      )
-    );
-
-  addHomePdfDownloadWidgets_(section, e, scan);
-
-  return section;
-}
-
-/**
- * List secure attachments and offer download — decrypt only when the user clicks.
- */
-function addHomePdfDownloadWidgets_(section, e, scan) {
-  var atts = (scan && scan.attachments) || [];
-  if (!atts.length) {
-    return;
-  }
-
-  var session = getWorkspaceSession_();
-  if (!session || !session.token) {
-    section.addWidget(
-      infoRow_(
-        "Secure attachment",
-        atts.length +
-          " encrypted file(s) found. Sign in, then tap Download decrypted file."
-      )
-    );
-    return;
-  }
-
-  section.addWidget(
-    statusRow_(
-      atts.length + " encrypted attachment(s) ready to decrypt.",
-      true
-    )
-  );
-  section.addWidget(
-    CardService.newButtonSet().addButton(
-      CardService.newTextButton()
-        .setText("Download decrypted file")
-        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-        .setOnClickAction(
-          CardService.newAction().setFunctionName("onHomeDownloadPdf_")
-        )
-    )
-  );
-}
-
-function onHomeDownloadPdf_(e) {
-  try {
-    var valid = getValidWorkspaceAuth_();
-    if (!valid) {
-      return CardService.newActionResponseBuilder()
-        .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
-        .setNotification(
-          CardService.newNotification().setText("Sign in first to download.")
-        )
-        .build();
-    }
-    var session = valid.session;
-    var auth = valid.auth;
-    var scan = scanMessageForSecureDoc_(e);
-    if (!scan.attachments || !scan.attachments.length) {
-      return CardService.newActionResponseBuilder()
-        .setNavigation(
-          CardService.newNavigation().updateCard(
-            buildDecryptErrorCard_("No secure attachment found on this mail.")
-          )
-        )
-        .setNotification(
-          CardService.newNotification().setText("No secure attachment found.")
-        )
-        .build();
-    }
-
-    var email = auth.email || session.email || "";
-    if (!email) {
-      return CardService.newActionResponseBuilder()
-        .setNavigation(
-          CardService.newNavigation().updateCard(
-            buildDecryptErrorCard_(
-              "Signed-in email missing. Sign out and sign in again."
-            )
-          )
-        )
-        .setNotification(
-          CardService.newNotification().setText("Signed-in email missing.")
-        )
-        .build();
-    }
-
-    var section = CardService.newCardSection().setHeader("Downloads");
-    var readyCount = 0;
-    var failCount = 0;
-    var i;
-    for (i = 0; i < scan.attachments.length; i++) {
-      var att = scan.attachments[i];
-      var fileDec = apiDecrypt_({
-        email: email,
-        fileCipherText: att.base64,
-        token: session.token,
-      });
-      if (!fileDec.ok) {
-        failCount += 1;
-        section.addWidget(
-          statusRow_(
-            (att.name || "file") +
-              ": " +
-              formatDecryptError_(fileDec, "decrypt failed"),
-            false
-          )
-        );
-        continue;
-      }
-      var fileInfo = fileDec.file || null;
-      var dataB64 =
-        (fileInfo &&
-          (fileInfo.dataBase64 || fileInfo.base64 || fileInfo.data)) ||
-        null;
-      if (!dataB64) {
-        failCount += 1;
-        section.addWidget(
-          statusRow_(
-            (att.name || "file") +
-              ": decrypt returned no file data. Try Refresh or open the mail again.",
-            false
-          )
-        );
-        continue;
-      }
-
-      var meta = normalizeDecryptedFileMeta_(
-        att.name,
-        fileInfo,
-        fileDec.filename
-      );
-      var ready = prepareDecryptedDownload_(meta.name, meta.mime, dataB64);
-      if (ready.ok && ready.downloadUrl) {
-        readyCount += 1;
-        section.addWidget(
-          CardService.newDecoratedText()
-            .setTopLabel("Ready")
-            .setText(meta.name)
-            .setBottomLabel("From " + (att.name || "secure file"))
-            .setWrapText(true)
-        );
-        section.addWidget(
-          CardService.newButtonSet().addButton(
-            CardService.newTextButton()
-              .setText("⬇ Download")
-              .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-              .setOpenLink(
-                CardService.newOpenLink()
-                  .setUrl(ready.downloadUrl)
-                  .setOpenAs(CardService.OpenAs.FULL_SIZE)
-                  .setOnClose(CardService.OnClose.NOTHING)
-              )
-          )
-        );
-      } else {
-        failCount += 1;
-        section.addWidget(
-          statusRow_(
-            meta.name + ": " + (ready.error || "download not ready"),
-            false
-          )
-        );
-      }
-    }
-
-    var card = CardService.newCardBuilder()
-      .setHeader(
-        cardHeader_(
-          "SecureDocShare",
-          readyCount ? "Downloads" : "Decrypt failed"
-        )
-      )
-      .addSection(section)
-      .addSection(
-        CardService.newCardSection().addWidget(
-          CardService.newButtonSet().addButton(
-            secondaryBtn_("Back", "onCardBack_")
-          )
-        )
-      )
-      .build();
-
-    var note = readyCount
-      ? readyCount + " file(s) ready to download."
-      : failCount
-        ? "Could not decrypt attachment(s). See error details on the card."
-        : "Could not prepare downloads.";
-
-    return CardService.newActionResponseBuilder()
-      .setNavigation(CardService.newNavigation().updateCard(card))
-      .setNotification(CardService.newNotification().setText(note))
-      .build();
-  } catch (err) {
-    var crash =
-      "Decrypt error: " + String(err && err.message ? err.message : err);
-    return CardService.newActionResponseBuilder()
-      .setNavigation(
-        CardService.newNavigation().updateCard(buildDecryptErrorCard_(crash))
-      )
-      .setNotification(CardService.newNotification().setText(crash))
-      .build();
-  }
-}
-
-function buildAutoDecryptCard_(e, session, scan) {
-  var auth = apiGetSubscription_(session.token);
-  if (!auth.ok) {
-    clearWorkspaceSession();
-    return CardService.newCardBuilder()
-      .setHeader(cardHeader_("SecureDocShare", "Session expired"))
-      .addSection(
-        CardService.newCardSection().addWidget(
-          statusRow_(
-            auth.error || "Login expired. Sign in again to decrypt.",
-            false
-          )
-        )
-      )
-      .addSection(buildLoginSection_(e))
-      .addSection(buildLinksSection_())
-      .build();
-  }
-
-  var email = auth.email || session.email || "";
-  var statusSection = CardService.newCardSection().setHeader("Status");
-  var messageSection = CardService.newCardSection().setHeader("Message");
-  var filesSection = CardService.newCardSection().setHeader("Files");
-  var hasMessageUi = false;
-  var hasFileUi = false;
-  var anyFailed = false;
-
-  if (!email) {
-    statusSection.addWidget(
-      statusRow_(
-        "Signed-in email missing. Sign out and sign in again to decrypt.",
-        false
-      )
-    );
-    return CardService.newCardBuilder()
-      .setHeader(cardHeader_("SecureDocShare", "Decrypt failed"))
-      .addSection(statusSection)
-      .addSection(buildSignedInSection_(session, auth))
-      .addSection(
-        CardService.newCardSection().addWidget(
-          CardService.newButtonSet()
-            .addButton(secondaryBtn_("Refresh", "onRefreshAutoDecrypt_"))
-            .addButton(secondaryBtn_("Home", "onCardBack_"))
-        )
-      )
-      .build();
-  }
-
-  var foundBits = [];
-  if (scan.cipher) foundBits.push("encrypted message");
-  if (scan.attachments && scan.attachments.length) {
-    foundBits.push(scan.attachments.length + " secure attachment(s)");
-  }
-  statusSection.addWidget(
-    statusRow_("Detected: " + foundBits.join(" + "), true)
-  );
-
-  if (scan.cipher) {
-    try {
-      var msgDec = apiDecrypt_({
-        email: email,
-        messageCipherText: scan.cipher,
-        token: session.token,
-      });
-      if (msgDec.ok && msgDec.message) {
-        hasMessageUi = true;
-        messageSection.addWidget(statusRow_("Message decrypted", true));
-        addDecryptedMessagePreview_(
-          messageSection,
-          "auto_plain_message",
-          "Decrypted message",
-          String(msgDec.message)
-        );
-      } else {
-        hasMessageUi = true;
-        anyFailed = true;
-        messageSection.addWidget(
-          statusRow_(
-            "Message decrypt failed: " +
-              formatDecryptError_(
-                msgDec,
-                msgDec && msgDec.ok
-                  ? "no message text returned"
-                  : "unknown error"
-              ),
-            false
-          )
-        );
-      }
-    } catch (msgErr) {
-      hasMessageUi = true;
-      anyFailed = true;
-      messageSection.addWidget(
-        statusRow_(
-          "Message decrypt error: " +
-            String(msgErr && msgErr.message ? msgErr.message : msgErr),
-          false
-        )
-      );
-    }
-  }
-
-  var i;
-  for (i = 0; i < (scan.attachments || []).length; i++) {
-    var att = scan.attachments[i];
-    try {
-      var fileDec = apiDecrypt_({
-        email: email,
-        fileCipherText: att.base64,
-        token: session.token,
-      });
-      if (!fileDec.ok) {
-        hasFileUi = true;
-        anyFailed = true;
-        filesSection.addWidget(
-          statusRow_(
-            (att.name || "attachment") +
-              " — " +
-              formatDecryptError_(fileDec, "decrypt failed"),
-            false
-          )
-        );
-        continue;
-      }
-
-      if (fileDec.message) {
-        hasFileUi = true;
-        filesSection.addWidget(
-          statusRow_("Attachment included message text", true)
-        );
-        addDecryptedMessagePreview_(
-          filesSection,
-          "auto_att_msg_" + i,
-          "From " + (att.name || "attachment"),
-          String(fileDec.message)
-        );
-      }
-
-      var fileInfo = fileDec.file || null;
-      var dataB64 =
-        (fileInfo &&
-          (fileInfo.dataBase64 || fileInfo.base64 || fileInfo.data)) ||
-        null;
-      if (dataB64) {
-        hasFileUi = true;
-        var meta = normalizeDecryptedFileMeta_(
-          att.name,
-          fileInfo,
-          fileDec.filename
-        );
-        var ready = prepareDecryptedDownload_(meta.name, meta.mime, dataB64);
-        if (ready.ok && ready.downloadUrl) {
-          filesSection.addWidget(
-            CardService.newDecoratedText()
-              .setTopLabel("File ready")
-              .setText(meta.name)
-              .setBottomLabel("From " + (att.name || "secure file"))
-              .setWrapText(true)
-          );
-          filesSection.addWidget(
-            CardService.newButtonSet().addButton(
-              CardService.newTextButton()
-                .setText("⬇ Download")
-                .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-                .setOpenLink(
-                  CardService.newOpenLink()
-                    .setUrl(ready.downloadUrl)
-                    .setOpenAs(CardService.OpenAs.FULL_SIZE)
-                    .setOnClose(CardService.OnClose.NOTHING)
-                )
-            )
-          );
-        } else {
-          anyFailed = true;
-          filesSection.addWidget(
-            statusRow_(
-              meta.name + ": " + (ready.error || "download not ready"),
-              false
-            )
-          );
-        }
-      } else if (!fileDec.message) {
-        hasFileUi = true;
-        anyFailed = true;
-        filesSection.addWidget(
-          statusRow_(
-            (att.name || "attachment") +
-              " — decrypt returned no file data.",
-            false
-          )
-        );
-      }
-    } catch (fileErr) {
-      hasFileUi = true;
-      anyFailed = true;
-      filesSection.addWidget(
-        statusRow_(
-          (att.name || "attachment") +
-            " — " +
-            String(fileErr && fileErr.message ? fileErr.message : fileErr),
-          false
-        )
-      );
-    }
-  }
-
-  if (anyFailed) {
-    statusSection.addWidget(
-      statusRow_(
-        "One or more items could not be decrypted. See details below.",
-        false
-      )
-    );
-  }
-
-  var builder = CardService.newCardBuilder().setHeader(
-    cardHeader_(
-      "SecureDocShare",
-      anyFailed && !hasMessageUi && !hasFileUi
-        ? "Decrypt failed"
-        : anyFailed
-          ? "Decrypted with errors"
-          : "Decrypted"
-    )
-  );
-  builder.addSection(statusSection);
-  if (hasMessageUi) builder.addSection(messageSection);
-  if (hasFileUi) builder.addSection(filesSection);
-  builder.addSection(buildSignedInSection_(session, auth));
-  builder.addSection(
-    CardService.newCardSection().addWidget(
-      CardService.newButtonSet()
-        .addButton(secondaryBtn_("Refresh", "onRefreshAutoDecrypt_"))
-        .addButton(secondaryBtn_("Home", "onCardBack_"))
-    )
-  );
-  builder.addSection(buildLinksSection_());
-  return builder.build();
-}
-
-function onRefreshAutoDecrypt_(e) {
-  return CardService.newActionResponseBuilder()
-    .setNavigation(CardService.newNavigation().updateCard(buildGmailMessageCard_(e)))
-    .build();
-}
-
-function buildLinksSection_() {
-  return CardService.newCardSection()
-    .setHeader("More")
-    .addWidget(
-      CardService.newTextButton()
-        .setText("Open admin panel")
-        .setOpenLink(
-          CardService.newOpenLink()
-            .setUrl(ADMIN_URL)
-            .setOpenAs(CardService.OpenAs.FULL_SIZE)
-            .setOnClose(CardService.OnClose.NOTHING)
-        )
-    );
-}
-
-function onCardToggleAuthMode_(e) {
-  var params = (e && e.parameters) || {};
-  var next = params.authMode === "signup" ? "signup" : "login";
-  setCardAuthMode_(next);
-  PropertiesService.getUserProperties().deleteProperty("SDS_CARD_OTP_SENT");
-  clearCardSignupDraft_();
-  return CardService.newActionResponseBuilder()
-    .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
-    .build();
-}
-
-var CARD_SIGNUP_DRAFT_KEY = "SDS_CARD_SIGNUP_DRAFT";
-
-function saveCardSignupDraft_(email, password, acceptTerms) {
-  PropertiesService.getUserProperties().setProperty(
-    CARD_SIGNUP_DRAFT_KEY,
-    JSON.stringify({
-      email: String(email || "").trim(),
-      password: String(password || ""),
-      acceptTerms: Boolean(acceptTerms),
-    })
-  );
-}
-
-function loadCardSignupDraft_() {
-  try {
-    var raw = PropertiesService.getUserProperties().getProperty(
-      CARD_SIGNUP_DRAFT_KEY
-    );
+    if (typeof localStorage === "undefined") return null;
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
     if (!raw) return null;
     return JSON.parse(raw);
   } catch (e) {
@@ -1115,2629 +134,909 @@ function loadCardSignupDraft_() {
   }
 }
 
-function clearCardSignupDraft_() {
-  PropertiesService.getUserProperties().deleteProperty(CARD_SIGNUP_DRAFT_KEY);
+function getStoredSession() {
+  return readSessionFromLocal();
 }
 
-function onCardGoogleSignIn_(e) {
-  var form = (e && e.formInput) || {};
-  var mode = getCardAuthMode_(e);
-  var isSignup = mode === "signup";
-  if (isSignup) {
-    var terms = form.accept_terms;
-    var accepted =
-      terms === "yes" ||
-      (Array.isArray(terms) && terms.indexOf("yes") >= 0);
-    if (!accepted) {
-      return notify_("Accept Terms & Conditions to sign up with Google.");
-    }
-  }
-  var url;
+function saveSession(session) {
+  const data = {
+    token: session && session.token ? String(session.token) : "",
+    expiresAt: session && session.expiresAt ? String(session.expiresAt) : null,
+    email: session && session.email ? String(session.email) : "",
+    savedAt: new Date().toISOString(),
+  };
   try {
-    url = getGoogleLoginUrl({
-      intent: isSignup ? "signup" : "login",
-      acceptTerms: true,
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(data));
+    }
+  } catch (e) {}
+  return data;
+}
+
+function clearSession() {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(SESSION_STORAGE_KEY);
+    }
+  } catch (e) {}
+}
+
+function logoutSession(options) {
+  options = options || {};
+  const baseUrl = normalizeBaseUrl(options.apiBaseUrl);
+  const session = getStoredSession();
+  const token = session && session.token ? session.token : null;
+
+  function finishLocal() {
+    clearSession();
+    return success(200, {
+      loggedOut: true,
+      serverCleared: Boolean(token),
     });
-  } catch (err) {
-    return notify_(String(err.message || err));
   }
-  if (!url) {
-    return notify_("Google sign-in URL is not configured.");
+
+  if (!token) {
+    return Promise.resolve(finishLocal());
   }
-  return CardService.newActionResponseBuilder()
-    .setOpenLink(
-      CardService.newOpenLink()
-        .setUrl(url)
-        .setOpenAs(CardService.OpenAs.FULL_SIZE)
-        .setOnClose(CardService.OnClose.RELOAD_ADD_ON)
-    )
-    .build();
+
+  return apiRequest(baseUrl, "/auth/logout", {
+    method: "POST",
+    token: token,
+    body: {},
+  })
+    .then(function (out) {
+      const local = finishLocal();
+      if (!out.res.ok) {
+        return success(200, {
+          loggedOut: true,
+          serverCleared: false,
+          warning: (out.data && out.data.error) || "Server logout failed",
+        });
+      }
+      return local;
+    })
+    .catch(function (err) {
+      finishLocal();
+      return success(200, {
+        loggedOut: true,
+        serverCleared: false,
+        warning: (err && err.message) || "Server logout failed",
+      });
+    });
 }
 
-function onCardResendOtp_(e) {
-  var form = (e && e.formInput) || {};
-  var draft = loadCardSignupDraft_() || {};
-  var email = String(form.login_email || draft.email || "").trim();
-  if (!email) return notify_("Enter email first.");
-  var terms = form.accept_terms;
-  var accepted =
-    terms === "yes" ||
-    (Array.isArray(terms) && terms.indexOf("yes") >= 0) ||
-    draft.acceptTerms === true;
-  if (!accepted) {
-    return notify_("Accept Terms & Conditions to sign up.");
-  }
-  var password = String(form.login_password || draft.password || "");
-  saveCardSignupDraft_(email, password, true);
-  var sent = apiSignupSendOtp_(email, true);
-  if (!sent.ok) return notify_(sent.error || "Could not send code.");
-  PropertiesService.getUserProperties().setProperty("SDS_CARD_OTP_SENT", "1");
-  setCardAuthMode_("signup");
-  return CardService.newActionResponseBuilder()
-    .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
-    .setNotification(
-      CardService.newNotification().setText(
-        sent.devOtp ? "Dev code: " + sent.devOtp : "Verification code sent."
-      )
-    )
-    .build();
+function isSessionExpiredLocally(session) {
+  if (!session || !session.token) return true;
+  if (!session.expiresAt) return false;
+  const exp = new Date(session.expiresAt).getTime();
+  if (!exp || isNaN(exp)) return false;
+  return exp <= Date.now() + 30 * 1000;
 }
 
-function onCardLogin_(e) {
-  var form = (e && e.formInput) || {};
-  var draft = loadCardSignupDraft_() || {};
-  var email = String(form.login_email || draft.email || "").trim();
-  var password = String(form.login_password || draft.password || "");
-  var mode = getCardAuthMode_(e);
-  var isSignup = mode === "signup";
+function ensureAuthSession(options) {
+  options = options || {};
+  const baseUrl = normalizeBaseUrl(options.apiBaseUrl);
+  const session = getStoredSession();
+
+  if (!session || !session.token) {
+    return Promise.resolve(
+      failure(401, {
+        error: loginRequiredMessage("You are not logged in."),
+        code: "LOGIN_REQUIRED",
+        loginUrl: getLoginWebUrl(),
+      })
+    );
+  }
+
+  if (isSessionExpiredLocally(session)) {
+    clearSession();
+    return Promise.resolve(
+      failure(440, {
+        error: loginRequiredMessage("Your session has expired."),
+        code: "TOKEN_EXPIRED",
+        loginUrl: getLoginWebUrl(),
+      })
+    );
+  }
+
+  return apiRequest(baseUrl, "/auth/subscription", {
+    method: "GET",
+    token: session.token,
+  })
+    .then(function (out) {
+      const res = out.res;
+      const data = out.data || {};
+      const status = res.status || 0;
+
+      if (
+        status === 440 ||
+        data.code === "RELOGIN_REQUIRED" ||
+        data.code === "TOKEN_EXPIRED"
+      ) {
+        clearSession();
+        return failure(440, {
+          error: loginRequiredMessage("Your session has expired."),
+          code: "TOKEN_EXPIRED",
+          loginUrl: getLoginWebUrl(),
+        });
+      }
+
+      if (
+        status === 401 ||
+        data.code === "TOKEN_MISSING" ||
+        data.code === "TOKEN_INVALID"
+      ) {
+        clearSession();
+        return failure(401, {
+          error: loginRequiredMessage("Your session is invalid."),
+          code: "LOGIN_REQUIRED",
+          loginUrl: getLoginWebUrl(),
+        });
+      }
+
+      if (!res.ok) {
+        return failure(
+          status || 500,
+          data,
+          data.error || "Could not verify login session"
+        );
+      }
+
+      const resolvedEmail = String(data.email || session.email || "")
+        .trim()
+        .toLowerCase();
+      if (
+        resolvedEmail &&
+        resolvedEmail !== String(session.email || "").toLowerCase()
+      ) {
+        saveSession({
+          token: session.token,
+          expiresAt: session.expiresAt,
+          email: resolvedEmail,
+        });
+      }
+
+      return success(200, {
+        authenticated: true,
+        token: session.token,
+        email: resolvedEmail || session.email || null,
+        expiresAt: session.expiresAt || null,
+        subscription: data,
+        loginUrl: getLoginWebUrl(),
+      });
+    })
+    .catch(function (err) {
+      return failure(500, {
+        error: (err && err.message) || "Could not verify login session",
+        code: "AUTH_CHECK_FAILED",
+        loginUrl: getLoginWebUrl(),
+      });
+    });
+}
+
+function normalizeEmailAddress(email) {
+  return String(email || "")
+    .trim()
+    .toLowerCase();
+}
+
+function storeAuthResponse(data, email) {
+  const token = data.token || data.accessToken || null;
+  if (!token) {
+    return failure(500, {
+      error: "Succeeded but no token was returned",
+      code: "TOKEN_MISSING",
+    });
+  }
+  const saved = saveSession({
+    token: token,
+    expiresAt: data.expiresAt || null,
+    email: data.email || email,
+  });
+  return success(200, {
+    authenticated: true,
+    token: saved.token,
+    email: saved.email,
+    expiresAt: saved.expiresAt,
+    loginUrl: getLoginWebUrl(),
+  });
+}
+
+function loginWithPassword(options) {
+  options = options || {};
+  const baseUrl = normalizeBaseUrl(options.apiBaseUrl);
+  const email = String(options.email || "").trim().toLowerCase();
+  const password = String(options.password || "");
 
   if (!email || !password) {
-    return notify_("Email and password are required.");
+    return Promise.resolve(
+      failure(400, {
+        error: "Email and password are required",
+        code: "CREDENTIALS_REQUIRED",
+      })
+    );
   }
 
-  if (isSignup) {
-    var terms = form.accept_terms;
-    var accepted =
-      terms === "yes" ||
-      (Array.isArray(terms) && terms.indexOf("yes") >= 0) ||
-      draft.acceptTerms === true;
-    if (!accepted) {
-      return notify_("Accept Terms & Conditions to sign up.");
+  return apiRequest(baseUrl, "/auth/login", {
+    method: "POST",
+    body: { email: email, password: password },
+  }).then(function (out) {
+    const res = out.res;
+    const data = out.data || {};
+    if (!res.ok) {
+      return failure(res.status || 401, data, data.error || "Login failed");
     }
-
-    var otpSent =
-      PropertiesService.getUserProperties().getProperty("SDS_CARD_OTP_SENT") ===
-      "1";
-    if (!otpSent) {
-      var send = apiSignupSendOtp_(email, true);
-      if (!send.ok) return notify_(send.error || "Could not send code.");
-      saveCardSignupDraft_(email, password, true);
-      PropertiesService.getUserProperties().setProperty("SDS_CARD_OTP_SENT", "1");
-      return CardService.newActionResponseBuilder()
-        .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
-        .setNotification(
-          CardService.newNotification().setText(
-            send.devOtp
-              ? "Dev code: " + send.devOtp
-              : "Code sent. Enter it below, then Verify & sign up."
-          )
-        )
-        .build();
-    }
-
-    var otp = String(form.signup_otp || "").trim();
-    if (!/^\d{4}$/.test(otp)) {
-      return notify_("Enter the 4-digit verification code.");
-    }
-    var signed = apiSignup_(email, password, otp, true);
-    if (!signed.ok) return notify_(signed.error || "Signup failed.");
-    PropertiesService.getUserProperties().deleteProperty("SDS_CARD_OTP_SENT");
-    clearCardSignupDraft_();
-    setCardAuthMode_("login");
-    saveWorkspaceSession({
-      token: signed.token,
-      email: signed.email || email,
-      expiresAt: signed.expiresAt || null,
-    });
-    return CardService.newActionResponseBuilder()
-      .setNavigation(
-        CardService.newNavigation().updateCard(buildGmailMessageCard_(e))
-      )
-      .setNotification(
-        CardService.newNotification().setText(
-          "Account created — signed in as " + (signed.email || email)
-        )
-      )
-      .build();
-  }
-
-  var result = apiLogin_(email, password);
-  if (!result.ok) {
-    return notify_(result.error || "Login failed.");
-  }
-
-  PropertiesService.getUserProperties().deleteProperty("SDS_CARD_OTP_SENT");
-  saveWorkspaceSession({
-    token: result.token,
-    email: result.email || email,
-    expiresAt: result.expiresAt || null,
+    return storeAuthResponse(data, email);
   });
-
-  return CardService.newActionResponseBuilder()
-    .setNavigation(
-      CardService.newNavigation().updateCard(buildGmailMessageCard_(e))
-    )
-    .setNotification(
-      CardService.newNotification().setText(
-        "Signed in as " + (result.email || email)
-      )
-    )
-    .build();
 }
 
-function onCardLogout_(e) {
-  var session = getWorkspaceSession_();
-  if (session && session.token) {
-    try {
-      UrlFetchApp.fetch(API_BASE + "/auth/logout", {
-        method: "post",
-        contentType: "application/json",
-        headers: { Authorization: "Bearer " + session.token },
-        payload: "{}",
-        muteHttpExceptions: true,
-      });
-    } catch (err) {}
-  }
-  clearWorkspaceSession();
-  setCardAuthMode_("login");
-  PropertiesService.getUserProperties().deleteProperty("SDS_CARD_OTP_SENT");
-  clearCardSignupDraft_();
-  return CardService.newActionResponseBuilder()
-    .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
-    .setNotification(CardService.newNotification().setText("Signed out."))
-    .build();
-}
+function sendSignupOtp(options) {
+  options = options || {};
+  const baseUrl = normalizeBaseUrl(options.apiBaseUrl);
+  const email = String(options.email || "").trim().toLowerCase();
+  const acceptTerms = options.acceptTerms === true;
 
-function onCardDecrypt_(e) {
-  try {
-    var form = (e && e.formInput) || {};
-    var cipher = String(form.decrypt_cipher || "").trim();
-    if (!cipher) {
-      try {
-        cipher = extractCipherFromMessage_(e) || "";
-      } catch (err) {}
-    }
-    if (!cipher) {
-      return CardService.newActionResponseBuilder()
-        .setNavigation(
-          CardService.newNavigation().updateCard(
-            buildDecryptErrorCard_("Paste ciphertext first, then decrypt.")
-          )
-        )
-        .setNotification(
-          CardService.newNotification().setText("Paste ciphertext first.")
-        )
-        .build();
-    }
-
-    var valid = getValidWorkspaceAuth_();
-    if (!valid) {
-      return CardService.newActionResponseBuilder()
-        .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
-        .setNotification(
-          CardService.newNotification().setText("Sign in first, then decrypt.")
-        )
-        .build();
-    }
-
-    var email = valid.auth.email || valid.session.email || "";
-    if (!email) {
-      return CardService.newActionResponseBuilder()
-        .setNavigation(
-          CardService.newNavigation().updateCard(
-            buildDecryptErrorCard_(
-              "Signed-in email missing. Sign out and sign in again, then decrypt."
-            )
-          )
-        )
-        .setNotification(
-          CardService.newNotification().setText("Signed-in email missing.")
-        )
-        .build();
-    }
-
-    var dec = apiDecrypt_({
-      email: email,
-      messageCipherText: cipher,
-      token: valid.session.token,
-    });
-    if (!dec.ok) {
-      var errText = formatDecryptError_(dec, "Decrypt failed.");
-      return CardService.newActionResponseBuilder()
-        .setNavigation(
-          CardService.newNavigation().updateCard(buildDecryptErrorCard_(errText))
-        )
-        .setNotification(CardService.newNotification().setText(errText))
-        .build();
-    }
-
-    if (!String(dec.message || "").trim()) {
-      var emptyErr =
-        "Decrypt succeeded but no message text was returned. Check the ciphertext and try again.";
-      return CardService.newActionResponseBuilder()
-        .setNavigation(
-          CardService.newNavigation().updateCard(buildDecryptErrorCard_(emptyErr))
-        )
-        .setNotification(CardService.newNotification().setText(emptyErr))
-        .build();
-    }
-
-    var section = CardService.newCardSection().addWidget(
-      CardService.newTextParagraph().setText(dec.message)
+  if (!email) {
+    return Promise.resolve(
+      failure(400, {
+        error: "Email is required",
+        code: "EMAIL_REQUIRED",
+      })
     );
-    section.addWidget(
-      CardService.newTextButton()
-        .setText("Back")
-        .setOnClickAction(CardService.newAction().setFunctionName("onCardBack_"))
-    );
-
-    var card = CardService.newCardBuilder()
-      .setHeader(cardHeader_("Decrypted", "SecureDocShare"))
-      .addSection(section)
-      .build();
-
-    return CardService.newActionResponseBuilder()
-      .setNavigation(CardService.newNavigation().pushCard(card))
-      .setNotification(
-        CardService.newNotification().setText("Message decrypted.")
-      )
-      .build();
-  } catch (err) {
-    var crash =
-      "Decrypt error: " + String(err && err.message ? err.message : err);
-    return CardService.newActionResponseBuilder()
-      .setNavigation(
-        CardService.newNavigation().updateCard(buildDecryptErrorCard_(crash))
-      )
-      .setNotification(CardService.newNotification().setText(crash))
-      .build();
   }
-}
-
-function onCardBack_(e) {
-  return CardService.newActionResponseBuilder()
-    .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
-    .build();
-}
-
-function getComposeDraftMeta_(e) {
-  var gmail = (e && e.gmail) || {};
-  var meta = (e && e.draftMetadata) || {};
-  var toList =
-    gmail.toRecipients ||
-    meta.toRecipients ||
-    meta.toRecipient ||
-    [];
-  var ccList = gmail.ccRecipients || meta.ccRecipients || [];
-  var bccList = gmail.bccRecipients || meta.bccRecipients || [];
-  if (typeof toList === "string") toList = [toList];
-  if (typeof ccList === "string") ccList = [ccList];
-  if (typeof bccList === "string") bccList = [bccList];
-  var to = [];
-  var i;
-  for (i = 0; i < (toList || []).length; i++) {
-    var t = String(toList[i] || "").trim();
-    if (t) to.push(t);
-  }
-  return {
-    to: to,
-    toJoined: to.join(", "),
-    cc: ccList || [],
-    bcc: bccList || [],
-    subject: String(gmail.subject || meta.subject || "").trim(),
-  };
-}
-
-function resolveComposeEncryptPayload_(e, gmailAccessToken) {
-  var draftMeta = getComposeDraftMeta_(e);
-  var toList = (draftMeta.to && draftMeta.to.length) ? draftMeta.to.slice() : [];
-
-  var matched = findMatchingGmailDraft_(
-    toList,
-    draftMeta.subject || "",
-    gmailAccessToken
-  );
-
-  var firstTo = "";
-  if (toList.length) {
-    firstTo = normalizeEmailAddress_(toList[0]) || String(toList[0]).trim();
-  } else if (matched.ok && matched.toEmails && matched.toEmails.length) {
-    firstTo = matched.toEmails[0];
-  }
-
-  var subject =
-    (matched.ok && matched.subject) || draftMeta.subject || "";
-  var message = (matched.ok && matched.body) || "";
-
-  var toJoined =
-    toList.join(", ") ||
-    (matched.ok && matched.toHeader) ||
-    firstTo;
-
-  return {
-    firstTo: firstTo,
-    toJoined: toJoined,
-    toList: toList,
-    subject: subject,
-    message: message,
-    matched: matched,
-  };
-}
-
-function runComposeEncryptAndSendCore_(e) {
-  var gate = verifyLoginAndSubscription_();
-  if (!gate.ok) {
-    return {
-      ok: false,
-      needLogin: true,
-      error: gate.error || "Login / subscription required.",
-    };
-  }
-
-  var tokenRes = getMarketplaceGmailAccess_(gate.token);
-  if (!tokenRes.ok || !tokenRes.accessToken) {
-    return {
-      ok: false,
-      needGmailConnect: true,
-      error:
-        tokenRes.error ||
-        "Connect Gmail once with your Google account, then try again.",
-      code: tokenRes.code || "GMAIL_NOT_CONNECTED",
-    };
-  }
-
-  var accessToken = tokenRes.accessToken;
-  var payload = resolveComposeEncryptPayload_(e, accessToken);
-  if (!payload.firstTo) {
-    return {
-      ok: false,
-      error:
-        "Add a recipient in To, wait for Gmail autosave, then try again.",
-    };
-  }
-  if (!String(payload.message || "").trim()) {
-    return {
-      ok: false,
-      error:
-        (payload.matched && payload.matched.error) ||
-        "No draft body found. Type your message, wait for autosave, then try again.",
-    };
-  }
-
-  // Reply/forward handling:
-  // - Decrypt any parent sds. with the signed-in user's keys
-  // - Strip old sdmeta (avoid duplicate / glued "testsdmeta")
-  // - Pure forward / empty new body: re-encrypt decrypted plain for the NEW To
-  // - Reply with new text: encrypt only the new text; append clear parent (no old meta)
-  var split = splitComposeNewAndQuoted_(payload.message);
-  var newMessage = String(split.newText || "").trim();
-  var quotedBlock = String(split.quotedBlock || "").trim();
-  var sessionEmail =
-    (gate.email && String(gate.email)) ||
-    (getWorkspaceSession_() && getWorkspaceSession_().email) ||
-    "";
-  var subject = payload.subject || "Secure document";
-  var isForwardSubject = /^(fw|fwd)\s*:/i.test(String(subject).trim());
-  var quotedClear = "";
-  var quotedAppendix = "";
-
-  // Body is only ciphertext (common on Forward with no markers).
-  if (!quotedBlock && /sds\./i.test(newMessage)) {
-    quotedBlock = newMessage;
-    newMessage = "";
-  }
-
-  if (quotedBlock) {
-    var quoteDec = decryptQuotedParentSds_(
-      quotedBlock,
-      gate.token,
-      sessionEmail
-    );
-    if (!quoteDec.ok) {
-      return {
-        ok: false,
-        error:
-          quoteDec.error ||
-          "Could not decrypt the quoted parent message. Open the original mail, decrypt once, then try again.",
-      };
-    }
-    quotedClear = stripSecureDocMetadataBlock_(
-      String(quoteDec.text || "").trim()
+  if (!acceptTerms) {
+    return Promise.resolve(
+      failure(400, {
+        error: "You must accept the Terms & Conditions to sign up",
+        code: "TERMS_REQUIRED",
+      })
     );
   }
 
-  if (newMessage && /sds\./i.test(newMessage)) {
-    var newDec = decryptQuotedParentSds_(
-      newMessage,
-      gate.token,
-      sessionEmail
-    );
-    if (!newDec.ok) {
-      return {
-        ok: false,
-        error:
-          newDec.error ||
-          "Could not decrypt the message body before encrypting for the new recipient.",
-      };
+  return apiRequest(baseUrl, "/auth/signup/send-otp", {
+    method: "POST",
+    body: { email: email, acceptTerms: true },
+  }).then(function (out) {
+    const res = out.res;
+    const data = out.data || {};
+    if (!res.ok) {
+      return failure(res.status || 400, data, data.error || "Could not send code");
     }
-    newMessage = stripSecureDocMetadataBlock_(String(newDec.text || "").trim());
-  }
-
-  var messageToEncrypt = newMessage;
-  if (!messageToEncrypt) {
-    // Pure forward / empty reply: re-encrypt parent plain for the NEW recipient.
-    messageToEncrypt = extractForwardPlainMessage_(quotedClear);
-    quotedAppendix = "";
-  } else if (quotedClear) {
-    // Reply with new text: keep parent readable, without old metadata.
-    quotedAppendix = isForwardSubject
-      ? ""
-      : extractForwardPlainMessage_(quotedClear);
-    if (isForwardSubject) {
-      // Forward + typed note: encrypt note + parent plain together for new To.
-      var parentPlain = extractForwardPlainMessage_(quotedClear);
-      messageToEncrypt = parentPlain
-        ? messageToEncrypt + "\n\n" + parentPlain
-        : messageToEncrypt;
-      quotedAppendix = "";
-    }
-  }
-
-  if (!String(messageToEncrypt || "").trim()) {
-    return {
-      ok: false,
-      error:
-        "Nothing to encrypt. Add a message, or forward an encrypted mail you can decrypt.",
-    };
-  }
-
-  var enc = apiEncrypt_(
-    payload.firstTo,
-    subject,
-    messageToEncrypt,
-    gate.token
-  );
-  if (!enc.ok) {
-    return { ok: false, error: enc.error || "Encrypt failed." };
-  }
-
-  var cipher = enc.messageCipherText || "";
-  var meta = enc.mailMetadata || null;
-  var bodyHtml = buildSecureComposeBodyHtml_(cipher, meta, quotedAppendix);
-  var bodyText = buildSecureComposeBodyText_(cipher, meta, quotedAppendix);
-  var toHeader = payload.toJoined || payload.firstTo;
-  var oldDraftId =
-    payload.matched && payload.matched.ok ? payload.matched.draftId || "" : "";
-
-  var mimeOpts = {
-    from: tokenRes.from || "",
-    to: toHeader,
-    cc:
-      payload.matched && payload.matched.ok
-        ? payload.matched.ccHeader || ""
-        : "",
-    bcc:
-      payload.matched && payload.matched.ok
-        ? payload.matched.bccHeader || ""
-        : "",
-    subject: subject,
-    html: bodyHtml,
-    text: bodyText,
-  };
-
-  // 1) Create encrypted draft → 2) send → 3) delete plaintext draft
-  var flow = gmailCreateEncryptedDraftSendAndCleanup_(
-    oldDraftId,
-    mimeOpts,
-    accessToken
-  );
-
-  if (flow.ok && flow.sent) {
-    return {
-      ok: true,
+    return success(200, {
       sent: true,
-      sendError: "",
-      oldDraftDeleted: Boolean(flow.oldDeleted),
-      warning: flow.error || "",
-      firstTo: payload.firstTo,
-      subject: subject,
-      bodyHtml: bodyHtml,
-    };
-  }
-
-  // Fallback: messages.send, then delete old plaintext draft
-  var sendRes = gmailMessagesSendWithToken_(accessToken, mimeOpts);
-  if (!sendRes.ok) {
-    return {
-      ok: false,
-      error:
-        flow.sendError ||
-        flow.error ||
-        sendRes.error ||
-        "Send failed. Re-authorize the SecureDocShare add-on and try again.",
-    };
-  }
-
-  var oldDeleted = false;
-  var warning = "";
-  if (oldDraftId) {
-    var del = gmailDraftDelete_(oldDraftId, accessToken);
-    if (del.ok) {
-      oldDeleted = true;
-    } else {
-      warning =
-        "Encrypted mail sent, but the old plaintext draft could not be deleted. Discard the open compose window.";
-    }
-  } else {
-    oldDeleted = true;
-  }
-
-  if (flow.newDraftId) {
-    gmailDraftDelete_(flow.newDraftId, accessToken);
-  }
-
-  return {
-    ok: true,
-    sent: true,
-    sendError: "",
-    oldDraftDeleted: oldDeleted,
-    warning: warning,
-    firstTo: payload.firstTo,
-    subject: subject,
-    bodyHtml: bodyHtml,
-  };
+      email: email,
+      devOtp: data.devOtp || null,
+    });
+  });
 }
 
-function buildComposeDirectCard_(e) {
-  var valid = getValidWorkspaceAuth_();
-  if (!valid) {
-    return CardService.newCardBuilder()
-      .setHeader(cardHeader_("SecureDocShare", "Login required"))
-      .addSection(buildLoginSection_(e))
-      .build();
-  }
+function signupWithPassword(options) {
+  options = options || {};
+  const baseUrl = normalizeBaseUrl(options.apiBaseUrl);
+  const email = String(options.email || "").trim().toLowerCase();
+  const password = String(options.password || "");
+  const otp = String(options.otp || "").trim();
+  const acceptTerms = options.acceptTerms === true;
 
-  return CardService.newCardBuilder()
-    .setHeader(cardHeader_("SecureDocShare", "Compose"))
-    .addSection(
-      CardService.newCardSection()
-        .addWidget(
-          CardService.newTextParagraph().setText(
-            "Encrypts this draft, sends the encrypted mail, and deletes the plaintext draft. Gmail uses your SecureDocShare Google OAuth client (not the Chrome extension)."
-          )
-        )
-        .addWidget(
-          CardService.newButtonSet().addButton(
-            CardService.newTextButton()
-              .setText("Encrypt & send")
-              .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-              .setOnClickAction(
-                CardService.newAction().setFunctionName(
-                  "onComposeEncryptAndSend_"
-                )
-              )
-          )
-        )
-    )
-    .build();
-}
-
-function buildComposeSentCard_(result) {
-  result = result || {};
-  var lines = ["Encrypted mail sent successfully."];
-  if (result.oldDraftDeleted) {
-    lines.push("Plain text draft removed. Please close this compose window and open a new one to send another email.");
-  } else if (result.warning) {
-    lines.push(String(result.warning));
-  }
-
-  return CardService.newCardBuilder()
-    .setHeader(cardHeader_("SecureDocShare", "Sent"))
-    .addSection(
-      CardService.newCardSection()
-        .addWidget(CardService.newTextParagraph().setText(lines.join("\n")))
-        // .addWidget(
-        //   CardService.newButtonSet().addButton(
-        //     CardService.newTextButton()
-        //       .setText("Done")
-        //       .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-        //       .setOnClickAction(
-        //         CardService.newAction().setFunctionName("onComposeSentDone_")
-        //       )
-        //   )
-        // )
-    )
-    .build();
-}
-
-function onComposeSentDone_(e) {
-  return CardService.newActionResponseBuilder()
-    .setNavigation(
-      CardService.newNavigation().updateCard(buildMainCard_(e))
-    )
-    .build();
-}
-
-/** Open Google OAuth with YOUR web client — full window, asks all Gmail scopes. */
-function openMarketplaceGmailConnect_(e, message) {
-  var session = getWorkspaceSession_() || {};
-  if (!session.token) {
-    return notify_("Sign in to SecureDocShare first.");
-  }
-  var connect = apiGmailConnectUrl_(session.token);
-  if (!connect.ok || !connect.url) {
-    return notify_(
-      connect.error ||
-        "Could not start Gmail connect. Deploy the server with /auth/gmail/connect, then try again."
+  if (!email || !password) {
+    return Promise.resolve(
+      failure(400, {
+        error: "Email and password are required",
+        code: "CREDENTIALS_REQUIRED",
+      })
     );
   }
-  return CardService.newActionResponseBuilder()
-    .setNotification(
-      CardService.newNotification().setText(
-        "Opening Google — allow Gmail access, then tap Encrypt & send again."
-      )
-    )
-    .setOpenLink(
-      CardService.newOpenLink()
-        .setUrl(connect.url)
-        .setOpenAs(CardService.OpenAs.FULL_SIZE)
-        .setOnClose(CardService.OnClose.RELOAD)
-    )
-    .build();
+  if (!acceptTerms) {
+    return Promise.resolve(
+      failure(400, {
+        error: "You must accept the Terms & Conditions to sign up",
+        code: "TERMS_REQUIRED",
+      })
+    );
+  }
+  if (!/^\d{4}$/.test(otp)) {
+    return Promise.resolve(
+      failure(400, {
+        error: "Enter the 4-digit verification code",
+        code: "OTP_REQUIRED",
+      })
+    );
+  }
+
+  return apiRequest(baseUrl, "/auth/signup", {
+    method: "POST",
+    body: {
+      email: email,
+      password: password,
+      acceptTerms: true,
+      otp: otp,
+    },
+  }).then(function (out) {
+    const res = out.res;
+    const data = out.data || {};
+    if (!res.ok) {
+      return failure(res.status || 400, data, data.error || "Signup failed");
+    }
+    return storeAuthResponse(data, email);
+  });
 }
 
-function onComposeEncryptAndSend_(e) {
-  var result;
+function loginWithOAuth(options) {
+  options = options || {};
+  return loginWithOAuthPopup_({
+    provider: String(options.provider || "").toLowerCase(),
+    intent: options.intent === "signup" ? "signup" : "login",
+    acceptTerms: options.acceptTerms === true,
+    apiBaseUrl: normalizeBaseUrl(options.apiBaseUrl),
+  });
+}
+
+function loginWithOAuthPopup_(options) {
+  const provider = options.provider;
+  const intent = options.intent;
+  const acceptTerms = options.acceptTerms;
+  const baseUrl = options.apiBaseUrl;
+
+  if (["google", "microsoft", "yahoo"].indexOf(provider) < 0) {
+    return Promise.resolve(
+      failure(400, {
+        error: "Unknown OAuth provider",
+        code: "OAUTH_PROVIDER_UNKNOWN",
+      })
+    );
+  }
+  if (intent === "signup" && !acceptTerms) {
+    return Promise.resolve(
+      failure(400, {
+        error: "You must accept the Terms & Conditions to sign up",
+        code: "TERMS_REQUIRED",
+      })
+    );
+  }
+
+  let returnOrigin = "https://server-nine-rosy.vercel.app";
+  const returnPath = "/api/auth/oauth/popup-done";
+  const appOrigin = String(baseUrl || "")
+    .replace(/\/api\/?$/i, "")
+    .replace(/\/$/, "");
   try {
-    result = runComposeEncryptAndSendCore_(e);
-  } catch (err) {
-    return CardService.newActionResponseBuilder()
-      .setNotification(
-        CardService.newNotification().setText(
-          "Encrypt/send error: " +
-            String(err && err.message ? err.message : err)
-        )
-      )
-      .build();
-  }
-
-  if (result.needLogin) {
-    return CardService.newActionResponseBuilder()
-      .setNavigation(
-        CardService.newNavigation().updateCard(buildComposeDirectCard_(e))
-      )
-      .setNotification(
-        CardService.newNotification().setText(
-          result.error || "Login / subscription required."
-        )
-      )
-      .build();
-  }
-
-  if (result.needGmailConnect) {
-    return openMarketplaceGmailConnect_(e, result.error);
-  }
-
-  if (!result.ok) {
-    // Fallback: any Gmail-not-connected style error should open Google prompt.
     if (
-      result.code === "GMAIL_NOT_CONNECTED" ||
-      /Connect Gmail|Gmail not connected|GMAIL_NOT_CONNECTED/i.test(
-        String(result.error || "")
-      )
+      typeof SecureDocConfig !== "undefined" &&
+      SecureDocConfig.ENV &&
+      SecureDocConfig.ENV.OAUTH_POPUP_DONE_ORIGIN
     ) {
-      return openMarketplaceGmailConnect_(e, result.error);
-    }
-    return CardService.newActionResponseBuilder()
-      .setNotification(
-        CardService.newNotification().setText(result.error || "Failed.")
-      )
-      .build();
-  }
-
-  if (!result.sent) {
-    return CardService.newActionResponseBuilder()
-      .setNotification(
-        CardService.newNotification().setText(
-          result.sendError || "Encrypted but send failed."
-        )
-      )
-      .build();
-  }
-
-  var note = "Encrypted mail sent.";
-  if (result.oldDraftDeleted) {
-    note += "";
-  } else if (result.warning) {
-    note += " " + result.warning;
-  }
-
-  return CardService.newActionResponseBuilder()
-    .setNotification(CardService.newNotification().setText(note))
-    .setStateChanged(true)
-    .setNavigation(
-      CardService.newNavigation().updateCard(buildComposeSentCard_(result))
-    )
-    .build();
-}
-
-function buildSecureComposeBodyHtml_(cipher, meta, quotedClear) {
-  var parts = [];
-  parts.push(
-    '<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.4;color:#202124">'
-  );
-  parts.push(
-    '<div style="font-family:Consolas,\'Courier New\',monospace;font-size:11px;line-height:1.35;word-break:break-all;color:#0F766E">' +
-      escapeHtml_(String(cipher || "").replace(/\s+/g, "")) +
-      "</div>"
-  );
-
-  if (meta && (meta.token || meta.emailEnc || meta.uuidEnc)) {
-    parts.push(
-      '<div style="margin-top:10px;padding-top:8px;border-top:1px solid #0F766E;font-family:Consolas,\'Courier New\',monospace;font-size:10px;line-height:1.35;word-break:break-all;color:#334155">'
-    );
-    if (meta.token) {
-      parts.push(
-        "<div>" + escapeHtml_(String(meta.token).replace(/\s+/g, "")) + "</div>"
+      returnOrigin = String(SecureDocConfig.ENV.OAUTH_POPUP_DONE_ORIGIN).replace(
+        /\/$/,
+        ""
       );
-    }
-    if (meta.emailEnc) {
-      parts.push("<div>email: " + escapeHtml_(meta.emailEnc) + "</div>");
-    }
-    if (meta.uuidEnc) {
-      parts.push("<div>uuid: " + escapeHtml_(meta.uuidEnc) + "</div>");
-    }
-    parts.push("</div>");
-  }
-
-  var siteUrl = String(ADMIN_URL || "https://admin-panel-amber-nine.vercel.app").replace(
-    /\/$/,
-    ""
-  );
-  parts.push(
-    '<div style="margin-top:14px;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.45;color:#475569">' +
-      "To know more, visit our website: " +
-      '<a href="' +
-      escapeHtml_(siteUrl) +
-      '" style="color:#0F766E;font-weight:600;text-decoration:underline" target="_blank" rel="noopener noreferrer">' +
-      escapeHtml_(siteUrl) +
-      "</a></div>"
-  );
-
-  var quote = String(quotedClear || "").trim();
-  if (quote) {
-    parts.push(
-      '<div style="margin-top:16px;padding-top:12px;border-top:1px solid #dadce0;color:#5f6368;font-size:12px;line-height:1.45;white-space:pre-wrap">' +
-        escapeHtml_(quote).replace(/\n/g, "<br>") +
-        "</div>"
-    );
-  }
-
-  parts.push("</div>");
-  return parts.join("");
-}
-
-/**
- * Split reply/forward draft into new text vs quoted parent thread.
- */
-function splitComposeNewAndQuoted_(body) {
-  var text = String(body || "").replace(/\r\n/g, "\n");
-  if (!String(text).trim()) {
-    return { newText: "", quotedBlock: "" };
-  }
-
-  var patterns = [
-    /\nOn .{8,240}?wrote:\s*\n/i,
-    /\n-+\s*Original Message\s*-+\s*\n/i,
-    /\n-+\s*Forwarded message\s*-+\s*\n/i,
-    /\nBegin forwarded message:\s*\n/i,
-  ];
-
-  var bestStart = -1;
-  for (var p = 0; p < patterns.length; p++) {
-    var m = patterns[p].exec(text);
-    if (!m) continue;
-    var start = m.index;
-    if (text.charAt(start) === "\n") start += 1;
-    if (bestStart < 0 || start < bestStart) bestStart = start;
-  }
-
-  // Fallback: quoted ciphertext after blank line(s) when reply markers missing.
-  if (bestStart < 0) {
-    var sdsAt = text.search(/(?:^|\n)sds\./i);
-    if (sdsAt > 0) {
-      bestStart = text.charAt(sdsAt) === "\n" ? sdsAt + 1 : sdsAt;
-      // Prefer split at blank line before sds if present.
-      var before = text.slice(0, bestStart);
-      var blank = before.lastIndexOf("\n\n");
-      if (blank >= 0 && blank + 2 < bestStart) {
-        bestStart = blank + 2;
+    } else if (appOrigin) {
+      if (
+        appOrigin.indexOf("script.google.com") < 0 &&
+        appOrigin.indexOf("googleusercontent.com") < 0
+      ) {
+        returnOrigin = appOrigin;
       }
     }
+  } catch (eOrigin) {}
+
+  // Workspace Google login/signup shares /auth/google/callback with Gmail connect.
+  // Microsoft/Yahoo keep the Outlook hub at /api/auth/oauth/:provider/start.
+  let start;
+  if (provider === "google") {
+    start =
+      (appOrigin || returnOrigin) +
+      "/auth/google/start?returnOrigin=" +
+      encodeURIComponent(returnOrigin) +
+      "&returnPath=" +
+      encodeURIComponent(returnPath) +
+      "&intent=" +
+      encodeURIComponent(intent);
+  } else {
+    start =
+      baseUrl +
+      "/auth/oauth/" +
+      encodeURIComponent(provider) +
+      "/start?returnOrigin=" +
+      encodeURIComponent(returnOrigin) +
+      "&returnPath=" +
+      encodeURIComponent(returnPath) +
+      "&intent=" +
+      encodeURIComponent(intent);
+  }
+  if (intent === "signup") {
+    start += "&acceptTerms=" + (acceptTerms ? "1" : "0");
   }
 
-  if (bestStart < 0) {
-    return { newText: text.trim(), quotedBlock: "" };
-  }
+  return new Promise(function (resolve) {
+    let settled = false;
+    let popup = null;
+    let timer = null;
 
-  return {
-    newText: text.slice(0, bestStart).trim(),
-    quotedBlock: text.slice(bestStart).trim(),
-  };
+    function settle(result) {
+      if (settled) return;
+      settled = true;
+      try {
+        if (timer) clearInterval(timer);
+      } catch (e0) {}
+      try {
+        window.removeEventListener("message", onMessage);
+      } catch (e) {}
+      try {
+        if (popup && !popup.closed) popup.close();
+      } catch (e2) {}
+      resolve(result);
+    }
+
+    function onMessage(ev) {
+      const data = ev && ev.data;
+      if (!data || data.type !== "securedoc-oauth") return;
+      if (data.ok && data.token) {
+        const saved = storeAuthResponse(
+          {
+            token: data.token,
+            expiresAt: data.expiresAt,
+            email: data.email,
+            refreshToken: data.refreshToken,
+          },
+          data.email || ""
+        );
+        try {
+          if (
+            typeof google !== "undefined" &&
+            google.script &&
+            google.script.run &&
+            typeof google.script.run.saveWorkspaceSession === "function"
+          ) {
+            google.script.run.saveWorkspaceSession({
+              token: data.token,
+              email: data.email || "",
+              expiresAt: data.expiresAt || null,
+            });
+          }
+        } catch (e3) {}
+        settle(saved);
+        return;
+      }
+      if (data.ok) {
+        refreshAuthFromServerAfterOAuth_(baseUrl).then(settle);
+        return;
+      }
+      settle(
+        failure(401, {
+          error: data.error || "Sign-in failed",
+          code: data.code || "OAUTH_FAILED",
+        })
+      );
+    }
+
+    window.addEventListener("message", onMessage);
+    popup = window.open(start, "securedoc_oauth", "width=520,height=680");
+    if (!popup) {
+      settle(
+        failure(500, {
+          error: "Popup blocked. Allow popups for this site and try again.",
+          code: "OAUTH_POPUP_BLOCKED",
+        })
+      );
+      return;
+    }
+    try {
+      popup.focus();
+    } catch (e3) {}
+
+    let ticks = 0;
+    timer = setInterval(function () {
+      ticks += 1;
+      try {
+        if (popup.closed) {
+          clearInterval(timer);
+          const session =
+            typeof getStoredSession === "function" ? getStoredSession() : null;
+          if (session && session.token) {
+            settle(
+              success(200, {
+                authenticated: true,
+                token: session.token,
+                email: session.email,
+                expiresAt: session.expiresAt,
+              })
+            );
+          } else {
+            settle(
+              failure(499, {
+                error: "Sign-in window closed",
+                code: "OAUTH_CANCELLED",
+              })
+            );
+          }
+        }
+      } catch (e) {}
+      if (ticks > 180) {
+        clearInterval(timer);
+        settle(
+          failure(408, {
+            error: "Sign-in timed out",
+            code: "OAUTH_TIMEOUT",
+          })
+        );
+      }
+    }, 1000);
+  });
 }
 
-/**
- * Decrypt sds. tokens in text → clear message.
- * Ensures a blank line before any leftover metadata so we never get "testsdmeta…".
- * Uses the signed-in user's email (keys for the mail they received).
- */
-function decryptQuotedParentSds_(quotedBlock, authToken, recipientEmail) {
-  var out = String(quotedBlock || "");
-  if (!out || !/sds\./i.test(out)) {
-    return { ok: true, text: out, decrypted: false };
-  }
-
-  var email = String(recipientEmail || "").trim();
-  if (!email || email.indexOf("@") < 0) {
-    var session = getWorkspaceSession_() || {};
-    email = String(session.email || "").trim();
-  }
-  if (!email || email.indexOf("@") < 0) {
-    return {
-      ok: false,
+function refreshAuthFromServerAfterOAuth_(baseUrl) {
+  return ensureAuthSession({ apiBaseUrl: baseUrl }).then(function (auth) {
+    if (auth && auth.ok && auth.authenticated) {
+      return success(200, {
+        authenticated: true,
+        token: auth.token,
+        email: auth.email,
+        expiresAt: auth.expiresAt,
+      });
+    }
+    return failure(401, {
       error:
-        "Signed-in email missing. Sign out and sign in again, then retry Encrypt & send.",
-      text: out,
-    };
-  }
-
-  var replaced = 0;
-  var guard = 0;
-  while (guard++ < 12) {
-    var span = extractSdsCipherSpan_(out);
-    if (!span) break;
-    var dec = apiDecrypt_({
-      email: email,
-      messageCipherText: span.cipher,
-      token: authToken,
+        "Google sign-in finished. Close this panel and reopen SecureDoc, or refresh.",
+      code: "OAUTH_SESSION_PENDING",
     });
-    if (!dec.ok) {
-      return {
-        ok: false,
-        error:
-          formatDecryptError_(dec, "Could not decrypt quoted parent message.") ||
-          "Could not decrypt quoted parent message.",
-        text: out,
-      };
-    }
-    var plain = String(dec.message || "").trim();
-    if (!plain) plain = "[Decrypted message was empty]";
-    var after = out.slice(span.end);
-    // Prevent "test" + "sdmeta…" → "testsdmeta…"
-    if (after && !/^\s/.test(after)) {
-      plain = plain + "\n\n";
-    } else if (after && /^\s*sdmeta\./i.test(after.replace(/^\s+/, ""))) {
-      plain = plain + "\n\n";
-    } else if (!/\n$/.test(plain) && /^\s*\n?\s*sdmeta\./i.test(after)) {
-      plain = plain + "\n\n";
-    }
-    out = out.slice(0, span.start) + plain + out.slice(span.end);
-    replaced += 1;
-  }
-
-  return { ok: true, text: out, decrypted: replaced > 0 };
+  });
 }
 
-/** Remove SecureDoc metadata blocks from plaintext (old recipient meta must not be forwarded). */
-function stripSecureDocMetadataBlock_(text) {
-  return String(text || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/sdmeta\.v1\.[A-Za-z0-9_-]+/gi, "")
-    .replace(/^\s*email:\s*enc:v1:\S+\s*$/gim, "")
-    .replace(/^\s*uuid:\s*uid:v1:\S+\s*$/gim, "")
-    .replace(/^\s*email:\s*$/gim, "")
-    .replace(/^\s*uuid:\s*$/gim, "")
-    .replace(/^\s*Metadata\s*$/gim, "")
-    .replace(/^\s*error:\s*.+$/gim, "")
-    .replace(/To know more, visit our website:\s*https?:\/\/\S+/gi, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+function fetchOAuthProviders(options) {
+  options = options || {};
+  const baseUrl = normalizeBaseUrl(options.apiBaseUrl);
+  return apiRequest(baseUrl, "/auth/oauth/providers", {
+    method: "GET",
+  }).then(function (out) {
+    if (!out.res.ok) {
+      return { providers: [] };
+    }
+    return {
+      providers: Array.isArray(out.data && out.data.providers)
+        ? out.data.providers
+        : [],
+    };
+  });
 }
 
-/**
- * From a decrypted forward/reply quote, keep the human message only
- * (drop Gmail "On … wrote:" / forwarded headers when possible).
- */
-function extractForwardPlainMessage_(text) {
-  var t = stripSecureDocMetadataBlock_(text);
-  if (!t) return "";
-
-  // Drop leading Gmail quote attribution line, keep body after it.
-  var onWrote = /^(On .+wrote:\s*)/i.exec(t);
-  if (onWrote) {
-    t = t.slice(onWrote[0].length).trim();
-  }
-  t = t
-    .replace(/^[-_]{5,}\s*Forwarded message\s*[-_]{5,}\s*/i, "")
-    .replace(/^Begin forwarded message:\s*/i, "")
-    .replace(/^[-_]{5,}\s*Original Message\s*[-_]{5,}\s*/i, "")
-    .replace(/^From:\s.+\nDate:\s.+\nSubject:\s.+\nTo:\s.+\n+/i, "")
-    .trim();
-
-  // Quoted lines starting with ">"
-  if (/^>/m.test(t) && t.split("\n").every(function (line) {
-    return !String(line).trim() || /^\s*>/.test(line);
-  })) {
-    t = t
-      .split("\n")
-      .map(function (line) {
-        return String(line).replace(/^\s*>\s?/, "");
+function completeOAuthTicket(options) {
+  options = options || {};
+  const baseUrl = normalizeBaseUrl(options.apiBaseUrl);
+  const ticket = String(options.ticket || options.oauth_ticket || "").trim();
+  if (!ticket) {
+    return Promise.resolve(
+      failure(400, {
+        error: "Missing OAuth ticket",
+        code: "OAUTH_TICKET_MISSING",
       })
-      .join("\n")
-      .trim();
+    );
   }
-
-  return stripSecureDocMetadataBlock_(t);
-}
-
-function saveWorkspaceSession(session) {
-  if (!session || !session.token) {
-    clearWorkspaceSession();
-    return { ok: true };
-  }
-  PropertiesService.getUserProperties().setProperty(
-    SESSION_KEY,
-    JSON.stringify({
-      token: String(session.token),
-      email: String(session.email || ""),
-      expiresAt: session.expiresAt || null,
-    })
-  );
-  return { ok: true };
-}
-
-function clearWorkspaceSession() {
-  PropertiesService.getUserProperties().deleteProperty(SESSION_KEY);
-  return { ok: true };
-}
-
-function getWorkspaceSession_() {
-  try {
-    const raw = PropertiesService.getUserProperties().getProperty(SESSION_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch (e) {
-    return null;
-  }
-}
-
-function getWorkspaceSession() {
-  return getWorkspaceSession_();
-}
-
-function verifyLoginAndSubscription_() {
-  const session = getWorkspaceSession_();
-  if (!session || !session.token) {
-    return { ok: false, error: "Sign in first (login required)." };
-  }
-  const sub = apiGetSubscription_(session.token);
-  if (!sub.ok) {
-    return { ok: false, error: sub.error || "Login token invalid." };
-  }
-  if (sub.subscriptionActive !== true) {
-    return { ok: false, error: "Subscription inactive. Renew to encrypt." };
-  }
-  return {
-    ok: true,
-    token: session.token,
-    email: String(sub.email || session.email || "").trim(),
-    subscriptionActive: true,
-  };
-}
-
-function apiLogin_(email, password) {
-  try {
-    var res = UrlFetchApp.fetch(API_BASE + "/auth/login", {
-      method: "post",
-      contentType: "application/json",
-      payload: JSON.stringify({ email: email, password: password }),
-      muteHttpExceptions: true,
-    });
-    var code = res.getResponseCode();
-    var data = {};
-    try {
-      data = JSON.parse(res.getContentText() || "{}");
-    } catch (err) {}
-    if (code < 200 || code >= 300) {
-      return { ok: false, error: data.error || "Login failed (" + code + ")" };
+  return apiRequest(baseUrl, "/auth/oauth/complete", {
+    method: "POST",
+    body: { ticket: ticket },
+  }).then(function (out) {
+    if (!out.res.ok) {
+      return failure(out.res.status, out.data, "OAuth complete failed");
     }
-    var token = data.token || data.accessToken;
+    const data = out.data || {};
+    const token = data.token || data.accessToken;
     if (!token) {
-      return { ok: false, error: "No token returned from login." };
+      return failure(401, { error: "No token from Google sign-in" });
     }
-    return {
-      ok: true,
-      token: token,
-      email: data.email || email,
-      expiresAt: data.expiresAt || null,
-    };
-  } catch (err) {
-    return { ok: false, error: String(err) };
-  }
-}
-
-function apiSignupSendOtp_(email, acceptTerms) {
-  try {
-    var res = UrlFetchApp.fetch(API_BASE + "/auth/signup/send-otp", {
-      method: "post",
-      contentType: "application/json",
-      payload: JSON.stringify({
-        email: email,
-        acceptTerms: acceptTerms === true,
-      }),
-      muteHttpExceptions: true,
-    });
-    var code = res.getResponseCode();
-    var data = {};
-    try {
-      data = JSON.parse(res.getContentText() || "{}");
-    } catch (err) {}
-    if (code < 200 || code >= 300) {
-      return {
-        ok: false,
-        error: data.error || "Could not send code (" + code + ")",
-      };
-    }
-    return {
-      ok: true,
-      devOtp: data.devOtp || null,
-    };
-  } catch (err) {
-    return { ok: false, error: String(err) };
-  }
-}
-
-function apiSignup_(email, password, otp, acceptTerms) {
-  try {
-    var res = UrlFetchApp.fetch(API_BASE + "/auth/signup", {
-      method: "post",
-      contentType: "application/json",
-      payload: JSON.stringify({
-        email: email,
-        password: password,
-        otp: otp,
-        acceptTerms: acceptTerms === true,
-      }),
-      muteHttpExceptions: true,
-    });
-    var code = res.getResponseCode();
-    var data = {};
-    try {
-      data = JSON.parse(res.getContentText() || "{}");
-    } catch (err) {}
-    if (code < 200 || code >= 300) {
-      return { ok: false, error: data.error || "Signup failed (" + code + ")" };
-    }
-    var token = data.token || data.accessToken;
-    if (!token) {
-      return { ok: false, error: "No token returned from signup." };
-    }
-    return {
-      ok: true,
-      token: token,
-      email: data.email || email,
-      expiresAt: data.expiresAt || null,
-    };
-  } catch (err) {
-    return { ok: false, error: String(err) };
-  }
-}
-
-function apiOAuthComplete_(ticket) {
-  try {
-    var res = UrlFetchApp.fetch(API_BASE + "/auth/oauth/complete", {
-      method: "post",
-      contentType: "application/json",
-      payload: JSON.stringify({ ticket: ticket }),
-      muteHttpExceptions: true,
-    });
-    var code = res.getResponseCode();
-    var data = {};
-    try {
-      data = JSON.parse(res.getContentText() || "{}");
-    } catch (err) {}
-    if (code < 200 || code >= 300) {
-      return {
-        ok: false,
-        error: data.error || "OAuth complete failed (" + code + ")",
-      };
-    }
-    var token = data.token || data.accessToken;
-    if (!token) {
-      return { ok: false, error: "No token from Google sign-in." };
-    }
-    return {
-      ok: true,
-      token: token,
-      email: data.email || "",
-      expiresAt: data.expiresAt || null,
-    };
-  } catch (err) {
-    return { ok: false, error: String(err) };
-  }
-}
-
-/**
- * Apps Script Google OAuth → SecureDocShare session (id_token verified on server).
- * Stores gmailRefreshToken in DB when Google returns offline access.
- */
-function apiLoginGoogle_(opts) {
-  opts = opts || {};
-  try {
-    var body = {
-      idToken: String(opts.idToken || ""),
-      intent: opts.intent === "signup" ? "signup" : "login",
-      acceptTerms: Boolean(opts.acceptTerms),
-    };
-    if (opts.gmailRefreshToken) {
-      body.gmailRefreshToken = String(opts.gmailRefreshToken);
-    }
-    if (opts.gmailScopes) {
-      body.gmailScopes = String(opts.gmailScopes);
-    }
-    var res = UrlFetchApp.fetch(API_BASE + "/auth/login/google", {
-      method: "post",
-      contentType: "application/json",
-      payload: JSON.stringify(body),
-      muteHttpExceptions: true,
-    });
-    var code = res.getResponseCode();
-    var data = {};
-    try {
-      data = JSON.parse(res.getContentText() || "{}");
-    } catch (err) {}
-    if (code < 200 || code >= 300) {
-      return {
-        ok: false,
-        error: data.error || "Google login failed (" + code + ")",
-        code: data.code || "",
-      };
-    }
-    var token = data.token || data.accessToken;
-    if (!token) {
-      return { ok: false, error: "No session token from server." };
-    }
-    return {
-      ok: true,
+    return success(200, {
       token: token,
       email: data.email || "",
       expiresAt: data.expiresAt || null,
       refreshToken: data.refreshToken || null,
-      gmailConnected: data.gmailConnected === true,
-    };
-  } catch (err) {
-    return { ok: false, error: String(err) };
-  }
+    });
+  });
 }
 
-function apiGetSubscription_(token) {
-  try {
-    var res = UrlFetchApp.fetch(API_BASE + "/auth/subscription", {
-      method: "get",
-      headers: { Authorization: "Bearer " + token },
-      muteHttpExceptions: true,
-    });
-    var code = res.getResponseCode();
-    var data = {};
-    try {
-      data = JSON.parse(res.getContentText() || "{}");
-    } catch (e) {}
-    if (code < 200 || code >= 300) {
-      return { ok: false, error: data.error || "Auth failed (" + code + ")" };
-    }
-    return {
-      ok: true,
-      email: data.email || "",
-      subscriptionActive: data.subscriptionActive !== false,
-      subscriptionExpiresAt: data.subscriptionExpiresAt || null,
-    };
-  } catch (err) {
-    return { ok: false, error: String(err) };
+function checkSenderSubscription(options) {
+  options = options || {};
+  const baseUrl = normalizeBaseUrl(options.apiBaseUrl);
+  const email = options.email || "";
+
+  if (!email) {
+    return Promise.resolve(
+      failure(400, {
+        error: "Email is required",
+        code: "EMAIL_REQUIRED",
+      })
+    );
   }
+
+  const qs = "?email=" + encodeURIComponent(String(email).trim().toLowerCase());
+
+  return apiRequest(baseUrl, "/public/subscription-check" + qs, {}).then(
+    function (out) {
+      const res = out.res;
+      const data = out.data || {};
+
+      if (res.status === 404 || data.exists === false) {
+        return failure(404, {
+          error: data.error || "No account found for this email",
+          code: data.code || "USER_NOT_FOUND",
+          exists: false,
+          subscriptionActive: false,
+        });
+      }
+
+      if (!res.ok || data.ok === false) {
+        return failure(
+          res.status || 500,
+          data,
+          data.error || "Failed to check subscription"
+        );
+      }
+
+      if (!data.subscriptionActive) {
+        return failure(403, {
+          error:
+            data.code === "SUBSCRIBER_NOT_CLAIMED"
+              ? "Account exists but has not been claimed yet"
+              : "Subscription is expired or inactive",
+          code: data.code || "SUBSCRIPTION_EXPIRED",
+          exists: true,
+          claimed: Boolean(data.claimed),
+          subscriptionActive: false,
+          subscriptionExpiresAt: data.subscriptionExpiresAt || null,
+          subscriptionDaysLeft:
+            data.subscriptionDaysLeft != null ? data.subscriptionDaysLeft : 0,
+        });
+      }
+
+      return success(200, {
+        exists: true,
+        claimed: Boolean(data.claimed),
+        subscriptionActive: true,
+        subscriptionExpiresAt: data.subscriptionExpiresAt || null,
+        subscriptionDaysLeft:
+          data.subscriptionDaysLeft != null ? data.subscriptionDaysLeft : null,
+        code: data.code || "SUBSCRIPTION_ACTIVE",
+        email: email,
+      });
+    }
+  );
 }
 
-function apiEncrypt_(to, subject, message, token) {
-  try {
-    var res = UrlFetchApp.fetch(API_BASE + "/files/encrypt", {
-      method: "post",
-      contentType: "application/json",
-      headers: { Authorization: "Bearer " + token },
-      payload: JSON.stringify({
-        recipientEmail: to,
-        subject: subject || "",
-        message: message || "",
-      }),
-      muteHttpExceptions: true,
-    });
-    var code = res.getResponseCode();
-    var data = {};
-    try {
-      data = JSON.parse(res.getContentText() || "{}");
-    } catch (e) {}
-    if (code < 200 || code >= 300) {
-      return { ok: false, error: data.error || "Encrypt failed (" + code + ")" };
-    }
-    return {
-      ok: true,
-      messageCipherText: data.messageCipherText || "",
-      attachment: data.attachment || null,
-      mailMetadata: data.mailMetadata || null,
-    };
-  } catch (err) {
-    return { ok: false, error: String(err) };
-  }
+;
+/**
+ * SecureDoc Workspace — Encrypt / decrypt client (slim; no Outlook thread helpers).
+ * Concatenated into Common.html by the Apps Script HTML build.
+ */
+
+function looksLikeBase64String(value) {
+  var s = String(value || "").replace(/\s+/g, "");
+  if (s.length < 80) return false;
+  if (s.indexOf("base64,") !== -1) return true;
+  return /^[A-Za-z0-9+/=_-]+$/.test(s);
+}
+
+function cleanBase64Payload(value) {
+  var s = String(value || "");
+  var idx = s.indexOf("base64,");
+  if (idx !== -1) s = s.slice(idx + 7);
+  return s.replace(/\s+/g, "");
 }
 
 /**
- * Gmail access via YOUR OAuth client (GOOGLE_GMAIL_CLIENT_ID on the server).
- * Not Apps Script's default GCP project — avoids "Gmail API disabled on project …".
+ * Pull decrypted file bytes from any SecureDoc decrypt response shape.
  */
-function getMarketplaceGmailAccess_(secureDocToken) {
-  try {
-    if (!secureDocToken) {
-      return {
-        ok: false,
-        code: "LOGIN_REQUIRED",
-        error: "Sign in to SecureDocShare first.",
-      };
-    }
-    var res = UrlFetchApp.fetch(API_BASE + "/auth/gmail/send-token", {
-      method: "post",
-      contentType: "application/json",
-      headers: { Authorization: "Bearer " + secureDocToken },
-      payload: "{}",
-      muteHttpExceptions: true,
-    });
-    var code = res.getResponseCode();
-    var data = {};
-    try {
-      data = JSON.parse(res.getContentText() || "{}");
-    } catch (e) {}
-    if (code < 200 || code >= 300) {
-      var err = data.error || "Gmail send-token failed (" + code + ")";
-      if (data.code === "GMAIL_NOT_CONNECTED" || code === 403) {
+function extractDecryptedFileBase64(res, fallbackName) {
+  if (!res) return null;
+
+  var fileName =
+    res.filename || res.fileName || fallbackName || "decrypted.bin";
+  var mimeType = res.mimeType || "application/octet-stream";
+
+  var direct =
+    res.decryptedBase64 ||
+    res.fileBase64 ||
+    res.decryptedFileBase64 ||
+    null;
+  if (direct && looksLikeBase64String(direct)) {
+    return {
+      base64: cleanBase64Payload(direct),
+      fileName: fileName,
+      mimeType: mimeType,
+    };
+  }
+
+  var file = res.file || res.attachment;
+  if (typeof file === "string" && looksLikeBase64String(file)) {
+    return {
+      base64: cleanBase64Payload(file),
+      fileName: fileName,
+      mimeType: mimeType,
+    };
+  }
+
+  if (file && typeof file === "object") {
+    var keys = [
+      "decryptedBase64",
+      "fileBase64",
+      "attachmentBase64",
+      "base64",
+      "content",
+      "data",
+      "binary",
+      "buffer",
+      "bytes",
+      "fileContent",
+      "decryptedContent",
+      "payload",
+      "body",
+    ];
+    var i;
+    for (i = 0; i < keys.length; i++) {
+      var val = file[keys[i]];
+      if (val && looksLikeBase64String(val)) {
         return {
-          ok: false,
-          code: "GMAIL_NOT_CONNECTED",
-          error:
-            "Connect Gmail once with your Google account (SecureDocShare), then try Encrypt & send again.",
+          base64: cleanBase64Payload(val),
+          fileName:
+            file.fileName ||
+            file.name ||
+            file.filename ||
+            fileName,
+          mimeType: file.mimeType || file.contentType || mimeType,
         };
       }
-      return { ok: false, code: data.code || "", error: err };
     }
-    return {
-      ok: true,
-      accessToken: data.accessToken || "",
-      from: data.from || "",
-      appUrl: data.appUrl || "",
-      scope: data.scope || "",
-      hasCompose: data.hasCompose === true,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      error: String(err && err.message ? err.message : err),
-    };
+    for (var k in file) {
+      if (!Object.prototype.hasOwnProperty.call(file, k)) continue;
+      if (keys.indexOf(k) !== -1) continue;
+      var v = file[k];
+      if (v && looksLikeBase64String(v)) {
+        return {
+          base64: cleanBase64Payload(v),
+          fileName:
+            file.fileName ||
+            file.name ||
+            file.filename ||
+            fileName,
+          mimeType: file.mimeType || file.contentType || mimeType,
+        };
+      }
+    }
   }
-}
 
-/** Start Gmail OAuth with YOUR web client (server /gmail/connect → /gmail/go). */
-function apiGmailConnectUrl_(secureDocToken) {
-  try {
-    var res = UrlFetchApp.fetch(API_BASE + "/auth/gmail/connect", {
-      method: "get",
-      headers: { Authorization: "Bearer " + secureDocToken },
-      muteHttpExceptions: true,
-    });
-    var code = res.getResponseCode();
-    var data = {};
-    try {
-      data = JSON.parse(res.getContentText() || "{}");
-    } catch (e) {}
-    if (code < 200 || code >= 300) {
-      return {
-        ok: false,
-        error: data.error || "Could not start Gmail connect (" + code + ")",
-      };
-    }
-    // Prefer same-origin /gmail/go (add-on OpenLink), then Google URL.
-    var openUrl = data.goUrl || data.url || "";
-    if (!openUrl) {
-      return { ok: false, error: "Gmail connect URL missing from server." };
-    }
-    return { ok: true, url: openUrl, googleUrl: data.url || "" };
-  } catch (err) {
-    return { ok: false, error: String(err) };
+  if (res.data && res.data !== res) {
+    return extractDecryptedFileBase64(res.data, fallbackName);
   }
+
+  return null;
 }
 
-/** HtmlService: token for Encrypt and send. */
-function getMarketplaceGmailSendToken() {
-  var session = getWorkspaceSession_() || {};
-  return getMarketplaceGmailAccess_(session.token);
-}
-
-function apiDecrypt_(options) {
-  options = options || {};
-  try {
-    var payload = {
-      email: options.email,
-    };
-    if (options.messageCipherText) {
-      payload.messageCipherText = options.messageCipherText;
-    }
-    if (options.fileCipherText) {
-      payload.fileCipherText = options.fileCipherText;
-    }
-    var headers = {};
-    if (options.token) {
-      headers.Authorization = "Bearer " + options.token;
-    }
-    var res = UrlFetchApp.fetch(API_BASE + "/public/decrypt", {
-      method: "post",
-      contentType: "application/json",
-      headers: headers,
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true,
-    });
-    var code = res.getResponseCode();
-    var data = {};
-    try {
-      data = JSON.parse(res.getContentText() || "{}");
-    } catch (e) {
-      return {
-        ok: false,
-        code: "BAD_RESPONSE",
-        error: "Decrypt failed: invalid server response (" + code + ").",
-      };
-    }
-    if (code < 200 || code >= 300 || data.ok === false) {
-      return {
-        ok: false,
-        code: data.code || "",
-        error:
-          data.error ||
-          data.message ||
-          "Decrypt failed (" + code + ").",
-      };
-    }
-    return {
-      ok: true,
-      message: data.message || null,
-      file: data.file || null,
-      filename: data.filename || null,
-      decrypted: true,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      code: "DECRYPT_EXCEPTION",
-      error: "Decrypt error: " + String(err && err.message ? err.message : err),
-    };
+function guessDecryptedFileName(name, mimeType) {
+  var n = String(name || "decrypted.bin");
+  if (/\.secure[a-z0-9]+$/i.test(n)) {
+    n = n.replace(/\.secure[a-z0-9]+$/i, "");
   }
-}
-
-function formatDecryptError_(result, fallback) {
-  var base = fallback || "Decrypt failed.";
-  if (!result) return base;
-  var msg = String(result.error || "").trim();
-  if (!msg) msg = base;
-  if (result.code && String(msg).indexOf(String(result.code)) < 0) {
-    msg = msg + " [" + result.code + "]";
-  }
-  return msg;
-}
-
-function buildDecryptErrorCard_(message) {
-  return CardService.newCardBuilder()
-    .setHeader(cardHeader_("SecureDocShare", "Decrypt failed"))
-    .addSection(
-      CardService.newCardSection()
-        .addWidget(statusRow_(String(message || "Decrypt failed."), false))
-        .addWidget(
-          CardService.newButtonSet().addButton(
-            secondaryBtn_("Back", "onCardBack_")
-          )
-        )
-    )
-    .build();
-}
-
-/** Exposed to HtmlService: return current user's OAuth token for People API. */
-function getWorkspaceOAuthToken() {
-  return ScriptApp.getOAuthToken();
+  if (/\.[a-z0-9]+$/i.test(n)) return n;
+  var mime = String(mimeType || "").toLowerCase();
+  if (mime === "application/pdf" || mime.indexOf("pdf") !== -1) return n + ".pdf";
+  if (mime.indexOf("image/png") === 0) return n + ".png";
+  if (mime.indexOf("image/jpeg") === 0) return n + ".jpg";
+  if (mime.indexOf("image/gif") === 0) return n + ".gif";
+  if (mime.indexOf("image/webp") === 0) return n + ".webp";
+  if (mime.indexOf("image/") === 0) return n + ".img";
+  if (mime.indexOf("text/") === 0) return n + ".txt";
+  return n + ".bin";
 }
 
 /**
- * Search Contacts + Other contacts (People API via marketplace OAuth).
- * @param {string} query
- * @returns {{ok:boolean, results:Array<{email:string,name:string}>, error?:string, code?:string}}
+ * Decrypt message and/or file cipher text for recipient.
+ * POST /public/decrypt
  */
-function searchWorkspaceContacts(query) {
-  try {
-    return searchWorkspaceContacts_(String(query || ""));
-  } catch (err) {
-    return {
-      ok: false,
-      results: [],
-      error: String(err && err.message ? err.message : err),
-      code: "CONTACTS_SEARCH_FAILED",
-    };
-  }
-}
+function decryptOnly(options) {
+  options = options || {};
+  var baseUrl = normalizeBaseUrl(options.apiBaseUrl);
+  var recipient =
+    options.email || options.to || options.receiverEmail || null;
 
-function searchWorkspaceContacts_(query) {
-  var q = String(query || "").trim();
-  if (q.length < 2) {
-    return { ok: true, results: [] };
+  if (!recipient) {
+    return Promise.resolve(
+      failure(400, {
+        error: "Recipient email is required",
+        code: "EMAIL_REQUIRED",
+      })
+    );
   }
 
-  var token = ScriptApp.getOAuthToken();
-  var mask = "names,emailAddresses";
-  var encoded = encodeURIComponent(q);
-  var maskEnc = encodeURIComponent(mask);
+  var msgCipher =
+    options.messageCipherText ||
+    options.packageText ||
+    options.encryptedMessage ||
+    null;
+  var fileCipher =
+    options.fileCipherText ||
+    options.packageBase64 ||
+    options.encryptedFile ||
+    options.encryptedPdf ||
+    null;
 
-  // Warmup (Google requires empty query once per session for freshness).
-  try {
-    UrlFetchApp.fetch(
-      "https://people.googleapis.com/v1/people:searchContacts?query=&readMask=" +
-        maskEnc +
-        "&pageSize=1",
-      {
-        method: "get",
-        headers: { Authorization: "Bearer " + token },
-        muteHttpExceptions: true,
-      }
+  if (!msgCipher && !fileCipher) {
+    return Promise.resolve(
+      failure(400, {
+        error: "Provide messageCipherText and/or fileCipherText",
+        code: "CIPHERTEXT_REQUIRED",
+      })
     );
-    UrlFetchApp.fetch(
-      "https://people.googleapis.com/v1/otherContacts:search?query=&readMask=" +
-        maskEnc +
-        "&pageSize=1",
-      {
-        method: "get",
-        headers: { Authorization: "Bearer " + token },
-        muteHttpExceptions: true,
-      }
-    );
-  } catch (eWarm) {}
+  }
 
-  var urls = [
-    "https://people.googleapis.com/v1/people:searchContacts?query=" +
-      encoded +
-      "&readMask=" +
-      maskEnc +
-      "&pageSize=30",
-    "https://people.googleapis.com/v1/otherContacts:search?query=" +
-      encoded +
-      "&readMask=" +
-      maskEnc +
-      "&pageSize=30",
-  ];
+  var body = { email: recipient };
+  if (msgCipher) body.messageCipherText = msgCipher;
+  if (fileCipher) body.fileCipherText = fileCipher;
 
-  var results = [];
-  var lastError = null;
-  var scopeError = false;
-  var disabledError = false;
+  return apiRequest(baseUrl, "/public/decrypt", {
+    method: "POST",
+    body: body,
+  }).then(function (out) {
+    var res = out.res;
+    var data = out.data || {};
 
-  for (var i = 0; i < urls.length; i++) {
-    var res = UrlFetchApp.fetch(urls[i], {
-      method: "get",
-      headers: {
-        Authorization: "Bearer " + token,
-        Accept: "application/json",
-      },
-      muteHttpExceptions: true,
-    });
-    var code = res.getResponseCode();
-    var text = res.getContentText() || "";
-    var data = {};
-    try {
-      data = JSON.parse(text || "{}");
-    } catch (eParse) {}
-
-    if (code < 200 || code >= 300) {
-      var msg = String(
-        (data.error && data.error.message) || text || "HTTP " + code
+    if (!res.ok || data.ok === false) {
+      return failure(
+        res.status || 500,
+        data,
+        data.error || "Decrypt failed"
       );
-      lastError = msg;
-      if (
-        /has not been used|is disabled|API has not been|SERVICE_DISABLED/i.test(
-          msg
-        )
-      ) {
-        disabledError = true;
-      }
-      if (
-        code === 401 ||
-        code === 403 ||
-        /insufficient|ACCESS_TOKEN_SCOPE|authentication scopes/i.test(msg)
-      ) {
-        scopeError = true;
-      }
-      continue;
     }
 
-    var rows = data.results || [];
-    for (var r = 0; r < rows.length; r++) {
-      var person = rows[r].person || rows[r] || {};
-      var name =
-        (person.names &&
-          person.names[0] &&
-          (person.names[0].displayName ||
-            person.names[0].unstructuredName)) ||
-        "";
-      var emails = person.emailAddresses || [];
-      for (var e = 0; e < emails.length; e++) {
-        var email = String(emails[e].value || "")
-          .trim()
-          .toLowerCase();
-        if (email.indexOf("@") < 0) continue;
-        results.push({
-          email: email,
-          name: name || email.split("@")[0],
-        });
-      }
-    }
-  }
-
-  var deduped = [];
-  var seen = {};
-  for (var d = 0; d < results.length; d++) {
-    var key = results[d].email;
-    if (seen[key]) continue;
-    seen[key] = true;
-    deduped.push(results[d]);
-  }
-
-  if (!deduped.length && lastError) {
-    if (disabledError) {
-      return {
-        ok: false,
-        results: [],
-        error:
-          "People API is disabled. Enable “People API” in Google Cloud Console, then try again.",
-        code: "PEOPLE_API_DISABLED",
-      };
-    }
-    if (scopeError) {
-      return {
-        ok: false,
-        results: [],
-        error:
-          "Google Contacts permission missing. Re-authorize the Workspace app and allow Contacts access.",
-        code: "CONTACTS_SCOPE_REQUIRED",
-      };
-    }
-    return {
-      ok: false,
-      results: [],
-      error: lastError,
-      code: "PEOPLE_API_ERROR",
-    };
-  }
-
-  return { ok: true, results: deduped };
-}
-
-function gmailApiRequest_(method, path, body, accessToken) {
-  try {
-    const token = accessToken || "";
-    if (!token) {
-      return {
-        ok: false,
-        code: 401,
-        error:
-          "Gmail access token missing. Re-authorize the SecureDocShare add-on.",
-      };
-    }
-    const options = {
-      method: String(method || "get").toLowerCase(),
-      headers: {
-        Authorization: "Bearer " + token,
-        Accept: "application/json",
-      },
-      muteHttpExceptions: true,
-    };
-    if (body != null) {
-      options.contentType = "application/json";
-      options.payload = JSON.stringify(body);
-    }
-    const res = UrlFetchApp.fetch(
-      "https://gmail.googleapis.com" + path,
-      options
-    );
-    const code = res.getResponseCode();
-    let data = {};
-    const text = res.getContentText() || "";
-    try {
-      data = JSON.parse(text || "{}");
-    } catch (err) {
-      data = { raw: text };
-    }
-    if (code < 200 || code >= 300) {
-      const errMsg =
-        (data && data.error && data.error.message) ||
-        data.error ||
-        text ||
-        "Gmail API error (" + code + ")";
-      return { ok: false, code: code, error: String(errMsg), data: data };
-    }
-    return { ok: true, code: code, data: data };
-  } catch (err) {
-    return { ok: false, error: String(err) };
-  }
-}
-
-function normalizeEmailAddress_(value) {
-  let s = String(value || "").trim().toLowerCase();
-  if (!s) return "";
-  const m = s.match(/<([^>]+)>/);
-  if (m && m[1]) s = String(m[1]).trim().toLowerCase();
-  s = s.replace(/^mailto:/i, "").trim();
-  if (s.indexOf("@") < 0) return "";
-  return s;
-}
-
-function extractEmailsFromHeader_(header) {
-  const out = [];
-  const parts = String(header || "").split(",");
-  for (let i = 0; i < parts.length; i++) {
-    const e = normalizeEmailAddress_(parts[i]);
-    if (e && out.indexOf(e) < 0) out.push(e);
-  }
-  return out;
-}
-
-function emailsOverlap_(a, b) {
-  if (!a || !a.length || !b || !b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (b.indexOf(a[i]) >= 0) return true;
-  }
-  return false;
-}
-
-function getMimeHeader_(headers, name) {
-  const want = String(name || "").toLowerCase();
-  for (let i = 0; i < (headers || []).length; i++) {
-    if (String((headers[i] && headers[i].name) || "").toLowerCase() === want) {
-      return String(headers[i].value || "");
-    }
-  }
-  return "";
-}
-
-function decodeBodyData_(data) {
-  if (!data) return "";
-  try {
-    let padded = String(data).replace(/-/g, "+").replace(/_/g, "/");
-    while (padded.length % 4) padded += "=";
-    return Utilities.newBlob(Utilities.base64Decode(padded)).getDataAsString(
-      "UTF-8"
-    );
-  } catch (err) {
-    try {
-      return Utilities.newBlob(
-        Utilities.base64DecodeWebSafe(String(data))
-      ).getDataAsString("UTF-8");
-    } catch (err2) {
-      return "";
-    }
-  }
-}
-
-function extractMessagePlainBody_(payload) {
-  if (!payload) return "";
-
-  function walk(part) {
-    if (!part) return { plain: "", html: "" };
-    const mime = String(part.mimeType || "").toLowerCase();
-    let plain = "";
-    let html = "";
-    if (mime === "text/plain" && part.body && part.body.data) {
-      plain = decodeBodyData_(part.body.data);
-    } else if (mime === "text/html" && part.body && part.body.data) {
-      html = decodeBodyData_(part.body.data);
-    }
-    const parts = part.parts || [];
-    for (let i = 0; i < parts.length; i++) {
-      const child = walk(parts[i]);
-      if (!plain && child.plain) plain = child.plain;
-      if (!html && child.html) html = child.html;
-    }
-    return { plain: plain, html: html };
-  }
-
-  const found = walk(payload);
-  if (found.plain && String(found.plain).trim()) {
-    return String(found.plain).replace(/\r\n/g, "\n").trim();
-  }
-  if (found.html) {
-    return String(found.html)
-      .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<\/p>/gi, "\n")
-      .replace(/<[^>]+>/g, "")
-      .replace(/&nbsp;/g, " ")
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"')
-      .replace(/\r\n/g, "\n")
-      .trim();
-  }
-  if (payload.body && payload.body.data) {
-    return decodeBodyData_(payload.body.data).trim();
-  }
-  return "";
-}
-
-function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
-  const targets = [];
-  for (let i = 0; i < (toEmails || []).length; i++) {
-    const e = normalizeEmailAddress_(toEmails[i]);
-    if (e && targets.indexOf(e) < 0) targets.push(e);
-  }
-  const subjectWant = String(subjectHint || "").trim().toLowerCase();
-
-  const list = gmailApiRequest_(
-    "get",
-    "/gmail/v1/users/me/drafts?maxResults=30",
-    null,
-    accessToken
-  );
-  if (!list.ok) {
-    const scopeHint = /insufficient|scope/i.test(String(list.error || ""))
-      ? " Re-authorize the SecureDocShare add-on (needs Gmail modify access)."
-      : "";
-    return {
-      ok: false,
-      error: (list.error || "Cannot list drafts.") + scopeHint,
-    };
-  }
-
-  const drafts = (list.data && list.data.drafts) || [];
-  if (!drafts.length) {
-    return {
-      ok: false,
-      error: "No drafts found. Wait for Gmail to autosave, then try again.",
-    };
-  }
-
-  let best = null;
-  for (let i = 0; i < drafts.length; i++) {
-    const id = drafts[i] && drafts[i].id;
-    if (!id) continue;
-    const full = gmailApiRequest_(
-      "get",
-      "/gmail/v1/users/me/drafts/" + encodeURIComponent(id) + "?format=full",
-      null,
-      accessToken
-    );
-    if (!full.ok) continue;
-    const draftObj = full.data || {};
-    const msg = draftObj.message || {};
-    const payload = msg.payload || {};
-    const headers = payload.headers || [];
-    const toHdr = getMimeHeader_(headers, "To");
-    const subj = getMimeHeader_(headers, "Subject");
-    const draftTos = extractEmailsFromHeader_(toHdr);
-    let score = 0;
-
-    if (targets.length) {
-      if (!emailsOverlap_(targets, draftTos)) continue;
-      score += 10;
-    } else if (draftTos.length) {
-      // Reply/forward: compose event often omits To — still match drafts that have recipients.
-      score += 8;
-    } else {
-      score += 1;
-    }
-
-    const subjNorm = String(subj || "").trim().toLowerCase();
-    if (subjectWant && subjNorm === subjectWant) {
-      score += 5;
-    } else if (
-      subjectWant &&
-      (subjNorm.indexOf(subjectWant) >= 0 || subjectWant.indexOf(subjNorm) >= 0)
-    ) {
-      score += 3;
-    } else if (/^(re|fw|fwd)\s*:/i.test(subjNorm)) {
-      score += 2;
-    }
-
-    // Prefer drafts that look like the open reply (have a body).
-    const body = extractMessagePlainBody_(payload);
-    if (body && body.length > 0) score += 1;
-    if (/sds\./i.test(body) || /On .+wrote:/i.test(body)) score += 2;
-
-    const candidate = {
-      ok: true,
-      draftId: draftObj.id || id,
-      messageId: msg.id || "",
-      toHeader: toHdr,
-      toEmails: draftTos.length ? draftTos : targets,
-      subject: subj || "",
-      body: body,
-      ccHeader: getMimeHeader_(headers, "Cc"),
-      bccHeader: getMimeHeader_(headers, "Bcc"),
-      score: score,
-    };
-
-    if (!best || candidate.score > best.score) {
-      best = candidate;
-    }
-    if (candidate.score >= 15) break;
-  }
-
-  if (!best) {
-    return {
-      ok: false,
-      error:
-        "Could not match an open draft. Add a recipient in To, wait for autosave, then try again.",
-    };
-  }
-  return best;
-}
-
-function sanitizeMimeHeader_(s) {
-  return String(s || "")
-    .replace(/[\r\n]+/g, " ")
-    .trim();
-}
-
-function buildRfc822EncryptedMime_(options) {
-  options = options || {};
-  const boundary = "SecureDocShareAlt_" + String(Date.now());
-  const lines = [
-    "To: " + sanitizeMimeHeader_(options.to),
-    "Subject: " + sanitizeMimeHeader_(options.subject || "Secure document"),
-    "MIME-Version: 1.0",
-    'Content-Type: multipart/alternative; boundary="' + boundary + '"',
-    "",
-    "--" + boundary,
-    "Content-Type: text/plain; charset=UTF-8",
-    "",
-    options.text || "",
-    "",
-    "--" + boundary,
-    "Content-Type: text/html; charset=UTF-8",
-    "",
-    options.html || "",
-    "",
-    "--" + boundary + "--",
-    "",
-  ];
-  if (options.cc) lines.splice(1, 0, "Cc: " + sanitizeMimeHeader_(options.cc));
-  if (options.bcc) {
-    lines.splice(
-      options.cc ? 2 : 1,
-      0,
-      "Bcc: " + sanitizeMimeHeader_(options.bcc)
-    );
-  }
-  if (options.from) {
-    lines.unshift("From: " + sanitizeMimeHeader_(options.from));
-  }
-  return lines.join("\r\n");
-}
-
-function encodeRawMime_(rfc822) {
-  return Utilities.base64EncodeWebSafe(rfc822, Utilities.Charset.UTF_8).replace(
-    /=+$/,
-    ""
-  );
-}
-
-/** Create a draft with recipient, subject, and encrypted body. */
-function gmailDraftCreate_(options, accessToken) {
-  const rfc822 = buildRfc822EncryptedMime_(options);
-  const raw = encodeRawMime_(rfc822);
-  return gmailApiRequest_(
-    "post",
-    "/gmail/v1/users/me/drafts",
-    { message: { raw: raw } },
-    accessToken
-  );
-}
-
-/** Send a draft (Gmail removes that draft after send). */
-function gmailDraftSend_(draftId, accessToken) {
-  if (!draftId) {
-    return { ok: false, error: "Draft id missing." };
-  }
-  return gmailApiRequest_(
-    "post",
-    "/gmail/v1/users/me/drafts/send",
-    { id: draftId },
-    accessToken
-  );
-}
-
-/** Delete a draft (used for the old plaintext compose). */
-function gmailDraftDelete_(draftId, accessToken) {
-  if (!draftId) {
-    return { ok: false, error: "Draft id missing." };
-  }
-  return gmailApiRequest_(
-    "delete",
-    "/gmail/v1/users/me/drafts/" + encodeURIComponent(draftId),
-    null,
-    accessToken
-  );
-}
-
-/**
- * Create encrypted draft → send it → delete old plaintext draft.
- * Returns { ok, newDraftId, sent, oldDeleted, error, sendError }.
- */
-function gmailCreateEncryptedDraftSendAndCleanup_(
-  oldDraftId,
-  mimeOpts,
-  accessToken
-) {
-  const created = gmailDraftCreate_(mimeOpts, accessToken);
-  if (!created.ok || !created.data) {
-    return {
-      ok: false,
-      newDraftId: "",
-      sent: false,
-      oldDeleted: false,
-      error: created.error || "Could not create encrypted draft.",
-      sendError: "",
-    };
-  }
-
-  const newDraftId = (created.data && created.data.id) || "";
-  if (!newDraftId) {
-    return {
-      ok: false,
-      newDraftId: "",
-      sent: false,
-      oldDeleted: false,
-      error: "Encrypted draft created but id missing.",
-      sendError: "",
-    };
-  }
-
-  const sentRes = gmailDraftSend_(newDraftId, accessToken);
-  if (!sentRes.ok) {
-    // Leave the encrypted draft for the user; do not delete plaintext yet.
-    return {
-      ok: false,
-      newDraftId: newDraftId,
-      sent: false,
-      oldDeleted: false,
-      error: "",
-      sendError: sentRes.error || "Could not send encrypted draft.",
-    };
-  }
-
-  let oldDeleted = false;
-  let deleteError = "";
-  if (oldDraftId && oldDraftId !== newDraftId) {
-    const del = gmailDraftDelete_(oldDraftId, accessToken);
-    if (del.ok) {
-      oldDeleted = true;
-    } else {
-      deleteError = del.error || "Could not delete the old plaintext draft.";
-    }
-  } else {
-    oldDeleted = true;
-  }
-
-  return {
-    ok: true,
-    newDraftId: newDraftId,
-    sent: true,
-    oldDeleted: oldDeleted,
-    error: deleteError,
-    sendError: "",
-  };
-}
-
-function gmailMessagesSendWithToken_(accessToken, options) {
-  try {
-    const rfc822 = buildRfc822EncryptedMime_(options);
-    const raw = encodeRawMime_(rfc822);
-    const res = UrlFetchApp.fetch(
-      "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-      {
-        method: "post",
-        contentType: "application/json",
-        headers: {
-          Authorization: "Bearer " + accessToken,
-          Accept: "application/json",
-        },
-        payload: JSON.stringify({ raw: raw }),
-        muteHttpExceptions: true,
-      }
-    );
-    const code = res.getResponseCode();
-    let data = {};
-    try {
-      data = JSON.parse(res.getContentText() || "{}");
-    } catch (err) {}
-    if (code < 200 || code >= 300) {
-      const errMsg =
-        (data && data.error && data.error.message) ||
-        data.error ||
-        "Gmail send failed (" + code + ")";
-      return { ok: false, code: code, error: String(errMsg) };
-    }
-    return { ok: true, data: data };
-  } catch (err) {
-    return { ok: false, error: String(err) };
-  }
-}
-
-function buildSecureComposeBodyText_(cipher, meta, quotedClear) {
-  const lines = [String(cipher || "").replace(/\s+/g, "")];
-  if (meta && (meta.token || meta.emailEnc || meta.uuidEnc)) {
-    lines.push("");
-    if (meta.token) lines.push(String(meta.token).replace(/\s+/g, ""));
-    if (meta.emailEnc) lines.push("email: " + meta.emailEnc);
-    if (meta.uuidEnc) lines.push("uuid: " + meta.uuidEnc);
-  }
-  lines.push("");
-  lines.push(
-    "To know more, visit our website: " +
-      String(
-        typeof ADMIN_URL !== "undefined" && ADMIN_URL
-          ? ADMIN_URL
-          : "https://admin-panel-amber-nine.vercel.app"
-      ).replace(/\/$/, "")
-  );
-  const quote = String(quotedClear || "").trim();
-  if (quote) {
-    lines.push("");
-    lines.push(quote);
-  }
-  return lines.join("\n");
-}
-
-function getGmailMessage_(e) {
-  if (!e || !e.gmail) return null;
-  var accessToken = e.gmail.accessToken;
-  var messageId = e.gmail.messageId;
-  if (!accessToken || !messageId) return null;
-  GmailApp.setCurrentMessageAccessToken(accessToken);
-  return GmailApp.getMessageById(messageId);
-}
-
-function scanMessageForSecureDoc_(e) {
-  var out = { cipher: "", attachments: [] };
-  try {
-    var msg = getGmailMessage_(e);
-    if (!msg) return out;
-    var body = msg.getPlainBody() || msg.getBody() || "";
-    out.cipher = extractSdsCipher_(body) || "";
-
-    var atts = [];
-    try {
-      atts =
-        msg.getAttachments({
-          includeInlineImages: false,
-          includeAttachments: true,
-        }) || [];
-    } catch (attErr) {
-      atts = msg.getAttachments() || [];
-    }
-    var i;
-    for (i = 0; i < atts.length; i++) {
-      var name = String(atts[i].getName() || "");
-      var lower = name.toLowerCase();
-      var bytes = atts[i].getBytes();
-      var isSecureName = /\.secure[a-z0-9]+$/i.test(lower);
-      var b0 = bytes && bytes.length >= 4 ? bytes[0] & 0xff : 0;
-      var b1 = bytes && bytes.length >= 4 ? bytes[1] & 0xff : 0;
-      var b2 = bytes && bytes.length >= 4 ? bytes[2] & 0xff : 0;
-      var b3 = bytes && bytes.length >= 4 ? bytes[3] & 0xff : 0;
-      var isSdsb = b0 === 0x53 && b1 === 0x44 && b2 === 0x53 && b3 === 0x42;
-      if (isSecureName || isSdsb) {
-        out.attachments.push({
-          name: name || "encrypted.securefile",
-          base64: Utilities.base64Encode(bytes),
-        });
-      }
-    }
-  } catch (err) {
-    console.error("scanMessageForSecureDoc_", err);
-  }
-  return out;
-}
-
-function extractCipherFromMessage_(e) {
-  return scanMessageForSecureDoc_(e).cipher || "";
-}
-
-/**
- * First sds. token in text, including start/end indexes in the original string
- * (whitespace inside the token is skipped when building cipher but included in the span).
- */
-function extractSdsCipherSpan_(text) {
-  var raw = String(text || "");
-  var match = /sds\./i.exec(raw);
-  if (!match) return null;
-
-  var start = match.index;
-  var i = match.index + 4;
-  var b64 = "";
-  while (i < raw.length) {
-    var ch = raw.charAt(i);
-    if (/\s/.test(ch)) {
-      i += 1;
-      continue;
-    }
-    if (/[A-Za-z0-9+/_\-]/.test(ch)) {
-      b64 += ch;
-      i += 1;
-      continue;
-    }
-    if (ch === "=") {
-      b64 += "=";
-      i += 1;
-      while (i < raw.length && /\s/.test(raw.charAt(i))) i += 1;
-      if (raw.charAt(i) === "=") {
-        b64 += "=";
-        i += 1;
-      }
-      break;
-    }
-    break;
-  }
-
-  if (b64.length < 8) return null;
-  return {
-    cipher: "sds." + b64,
-    start: start,
-    end: i,
-  };
-}
-
-function extractSdsCipher_(text) {
-  var span = extractSdsCipherSpan_(text);
-  return span ? span.cipher : "";
-}
-
-/**
- * Show ~4 lines in the card. "Show full message" downloads a .txt file
- * with the complete decrypted message (same download flow as PDF).
- */
-function addDecryptedMessagePreview_(section, fieldName, title, fullText) {
-  var preview = previewFourLines_(fullText);
-  section.addWidget(
-    CardService.newTextInput()
-      .setFieldName(fieldName)
-      .setTitle(title + " (first 4 lines)")
-      .setMultiline(true)
-      .setValue(preview)
-  );
-
-  var ready = prepareFullMessageTxtDownload_(fullText);
-  if (ready.ok && ready.downloadUrl) {
-    section.addWidget(
-      CardService.newButtonSet().addButton(
-        CardService.newTextButton()
-          .setText("Show full message (.txt)")
-          .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-          .setOpenLink(
-            CardService.newOpenLink()
-              .setUrl(ready.downloadUrl)
-              .setOpenAs(CardService.OpenAs.FULL_SIZE)
-              .setOnClose(CardService.OnClose.NOTHING)
-          )
-      )
-    );
-  } else {
-    section.addWidget(
-      infoRow_(
-        "Full message",
-        ready.error || "Could not prepare message download."
-      )
-    );
-  }
-}
-
-function previewFourLines_(text) {
-  var s = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  var lines = s.split("\n");
-  if (lines.length <= 4) {
-    if (s.length <= 280) return s;
-    return s.substring(0, 280) + "…";
-  }
-  return lines.slice(0, 4).join("\n") + "\n…";
-}
-
-/**
- * Build a .txt file from the full decrypted message and stage it for download.
- */
-function prepareFullMessageTxtDownload_(fullText) {
-  var text = String(fullText || "");
-  if (!text) {
-    return { ok: false, error: "Empty message", downloadUrl: "" };
-  }
-
-  // Strip HTML to plain text for the .txt file.
-  if (/<\/?[a-z][\s\S]*>/i.test(text)) {
-    text = text
-      .replace(/<\s*br\s*\/?>/gi, "\n")
-      .replace(/<\/\s*p\s*>/gi, "\n\n")
-      .replace(/<[^>]+>/g, "")
-      .replace(/&nbsp;/gi, " ")
-      .replace(/&amp;/gi, "&")
-      .replace(/&lt;/gi, "<")
-      .replace(/&gt;/gi, ">")
-      .replace(/&quot;/gi, '"')
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-  }
-
-  var stamp = Utilities.formatDate(
-    new Date(),
-    Session.getScriptTimeZone() || "UTC",
-    "yyyyMMdd-HHmmss"
-  );
-  var filename = "securedoc-message-" + stamp + ".txt";
-  var b64 = Utilities.base64Encode(text);
-  return prepareDecryptedDownload_(filename, "text/plain;charset=utf-8", b64);
-}
-
-/**
- * Restore decrypted file to original name/mime (do not force .pdf).
- */
-
-function normalizeDecryptedFileMeta_(attName, fileInfo, fallbackName) {
-  var raw =
-    (fileInfo && (fileInfo.filename || fileInfo.name)) ||
-    fallbackName ||
-    attName ||
-    "document.bin";
-  var name = String(raw).replace(/[\\/:*?"<>|]/g, "_");
-  if (/\.secure[a-z0-9]+$/i.test(name)) {
-    name = name.replace(/\.secure[a-z0-9]+$/i, "");
-  }
-  var mime =
-    (fileInfo && (fileInfo.mimeType || fileInfo.contentType)) ||
-    "application/octet-stream";
-  if (!/\.[a-z0-9]+$/i.test(name)) {
-    if (/pdf/i.test(mime)) name = name + ".pdf";
-    else if (/png/i.test(mime)) name = name + ".png";
-    else if (/jpeg|jpg/i.test(mime)) name = name + ".jpg";
-    else if (/gif/i.test(mime)) name = name + ".gif";
-    else if (/webp/i.test(mime)) name = name + ".webp";
-    else if (/image\//i.test(mime)) name = name + ".img";
-    else if (/text\//i.test(mime)) name = name + ".txt";
-    else name = name + ".bin";
-  }
-  if (/\.pdf$/i.test(name)) mime = "application/pdf";
-  else if (/\.png$/i.test(name)) mime = "image/png";
-  else if (/\.jpe?g$/i.test(name)) mime = "image/jpeg";
-  else if (/\.gif$/i.test(name)) mime = "image/gif";
-  else if (/\.webp$/i.test(name)) mime = "image/webp";
-  else if (/\.txt$/i.test(name) && mime === "application/octet-stream") {
-    mime = "text/plain";
-  }
-  return { name: name, mime: mime };
-}
-
-/**
- * Decrypt → stage bytes in Apps Script cache → Download button saves to computer.
- * No server / Drive / DB. Gmail cannot write disk directly, so the button opens a
- * tiny download page that only triggers the browser Save dialog (not the login UI).
- *
- * Web app deploy MUST be: Execute as = Me, Who has access = Anyone
- * (If you pick "Anyone with Google account", Google shows a login screen.)
- */
-function prepareDecryptedDownload_(filename, mimeType, dataBase64) {
-  var safeName = String(filename || "decrypted.bin").replace(/[\\/:*?"<>|]/g, "_");
-  var mime = mimeType || "application/octet-stream";
-  var b64 = String(dataBase64 || "").replace(/\s+/g, "");
-  if (!b64) {
-    return { ok: false, error: "Empty file bytes", downloadUrl: "" };
-  }
-
-  var web = getWebAppUrl_();
-  if (!web) {
-    return {
-      ok: false,
-      error:
-        "Deploy Web app first: Deploy → New deployment → Web app → Execute as Me, Access Anyone.",
-      downloadUrl: "",
-    };
-  }
-
-  try {
-    var key = Utilities.getUuid().replace(/-/g, "").slice(0, 24);
-    var CHUNK = 90000;
-    var chunks = Math.ceil(b64.length / CHUNK) || 1;
-    if (chunks > 80) {
-      return {
-        ok: false,
-        error: "File too large for add-on download.",
-        downloadUrl: "",
-      };
-    }
-    // ScriptCache works when Web app runs as "Me" (UserCache does not).
-    var meta = JSON.stringify({ n: safeName, m: mime, c: chunks });
-    putDownloadCache_("sdl_" + key, meta);
-    var i;
-    for (i = 0; i < chunks; i++) {
-      putDownloadCache_("sdl_" + key + "_" + i, b64.substr(i * CHUNK, CHUNK));
-    }
-    var sep = web.indexOf("?") >= 0 ? "&" : "?";
-    return {
-      ok: true,
-      downloadUrl: web + sep + "download=" + encodeURIComponent(key),
-    };
-  } catch (cacheErr) {
-    return {
-      ok: false,
-      error: String(cacheErr),
-      downloadUrl: "",
-    };
-  }
-}
-
-function putDownloadCache_(k, v) {
-  CacheService.getScriptCache().put(k, v, 600);
-  try {
-    CacheService.getUserCache().put(k, v, 600);
-  } catch (e) {}
-}
-
-function getDownloadCache_(k) {
-  var v = CacheService.getScriptCache().get(k);
-  if (v != null) return v;
-  try {
-    return CacheService.getUserCache().get(k);
-  } catch (e) {
-    return null;
-  }
-}
-
-function escapeHtml_(s) {
-  return String(s || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function notify_(text) {
-  return CardService.newActionResponseBuilder()
-    .setNotification(CardService.newNotification().setText(String(text || "")))
-    .build();
-}
-
-function getWebAppUrl_() {
-  if (WEB_APP_URL && String(WEB_APP_URL).indexOf("http") === 0) {
-    return String(WEB_APP_URL);
-  }
-  try {
-    var url = ScriptApp.getService().getUrl();
-    if (url && String(url).indexOf("http") === 0) return String(url);
-  } catch (e) {}
-  return "";
-}
-
-/** Web app: ?download= | OAuth callback | Index panel */
-function doGet(e) {
-  e = e || {};
-  var params = e.parameter || {};
-  var downloadKey = params.download || "";
-  if (!downloadKey && e.parameters && e.parameters.download) {
-    downloadKey = e.parameters.download[0] || "";
-  }
-  if (downloadKey) {
-    return serveCachedDownload_(String(downloadKey));
-  }
-
-  var oauthError = params.oauth_error || "";
-  if (!oauthError && e.parameters && e.parameters.oauth_error) {
-    oauthError = e.parameters.oauth_error[0] || "";
-  }
-  var oauthTicket = params.oauth_ticket || "";
-  if (!oauthTicket && e.parameters && e.parameters.oauth_ticket) {
-    oauthTicket = e.parameters.oauth_ticket[0] || "";
-  }
-
-  if (oauthError) {
-    return HtmlService.createHtmlOutput(
-      "<!DOCTYPE html><html><body style='font-family:Arial,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
-        "<p style='font-size:18px;font-weight:700'>SecureDocShare</p>" +
-        "<p style='color:#ff6b7a'>Sign-in failed: " +
-        escapeHtml_(oauthError) +
-        "</p>" +
-        "<p style='color:#9db4bd'>Close this tab and try again from the Gmail add-on.</p>" +
-        "</body></html>"
-    ).setTitle("Sign-in failed");
-  }
-
-  if (oauthTicket) {
-    // Legacy fallback: ticket landed on Apps Script instead of API popup-done.
-    // Complete server-side, then tell opener (or show close page).
-    var done = apiOAuthComplete_(String(oauthTicket));
-    if (!done.ok) {
-      return HtmlService.createHtmlOutput(
-        "<!DOCTYPE html><html><body style='font-family:Arial,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
-          "<p style='font-size:18px;font-weight:700'>SecureDocShare</p>" +
-          "<p style='color:#ff6b7a'>" +
-          escapeHtml_(done.error || "Google sign-in failed") +
-          "</p>" +
-          "<p style='color:#9db4bd'>Close this tab and try again.</p>" +
-          "</body></html>"
-      ).setTitle("Sign-in failed");
-    }
-    saveWorkspaceSession({
-      token: done.token,
-      email: done.email,
-      expiresAt: done.expiresAt || null,
+    return success(res.status, {
+      decrypted: true,
+      recipientUuid: data.recipientUuid || null,
+      recipientEmail: data.recipientEmail || null,
+      recipientClaimed: Boolean(data.recipientClaimed),
+      messageDecrypted: Boolean(data.messageDecrypted),
+      fileDecrypted: Boolean(data.fileDecrypted),
+      message: data.message || null,
+      file: data.file || data.attachment || null,
+      kind: data.kind || null,
+      filename: data.filename || data.fileName || null,
+      decryptedBase64:
+        data.decryptedBase64 ||
+        data.fileBase64 ||
+        data.decryptedFileBase64 ||
+        null,
+      mimeType: data.mimeType || null,
     });
-    var payload = {
-      type: "securedoc-oauth",
-      ok: true,
-      token: done.token || "",
-      email: done.email || "",
-      expiresAt: done.expiresAt || null,
-      refreshToken: done.refreshToken || null,
-    };
-    return HtmlService.createHtmlOutput(
-      "<!DOCTYPE html><html><body style='font-family:Arial,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
-        "<p style='font-size:18px;font-weight:700'>SecureDocShare</p>" +
-        "<p style='color:#2bb3a0'>✔ Signed in as " +
-        escapeHtml_(done.email || "user") +
-        "</p>" +
-        "<p style='color:#9db4bd'>Closing this window…</p>" +
-        "<script>(function(){var p=" +
-        JSON.stringify(payload) +
-        ";try{if(window.opener&&!window.opener.closed){window.opener.postMessage(p,'*');}}catch(e){}" +
-        "setTimeout(function(){try{window.close();}catch(e2){}" +
-        "document.body.innerHTML='<p style=\"font-family:Arial;padding:24px\">Signed in. You can close this tab and return to Gmail.</p>';},500);})();</script>" +
-        "</body></html>"
-    )
-      .setTitle("Signed in")
-      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
-  }
-
-  // Compose & send modal from Gmail card — compose-only (uses add-on session).
-  var view = String(params.view || "");
-  var embed = String(params.embed || "");
-  if (view === "compose" || view === "encrypt" || embed === "1") {
-    return serveComposeModal_(params);
-  }
-
-  // Must use Template so <?!= include(...) ?> in Index.html are evaluated.
-  return HtmlService.createTemplateFromFile("Index")
-    .evaluate()
-    .setTitle("SecureDocShare Workspace")
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  });
 }
 
-/** Overlay compose UI — no login shell; session from ticket or UserProperties. */
-function serveComposeModal_(params) {
-  var session = null;
-  var ticket = String((params && params.compose_ticket) || "").trim();
+;
+(function exposeSecureDocApi(g) {
+  if (!g) return;
+  g.SecureDocConfig =
+    typeof SecureDocConfig !== "undefined" ? SecureDocConfig : g.SecureDocConfig;
+  g.DEFAULT_API_BASE =
+    (typeof SecureDocConfig !== "undefined" && SecureDocConfig.getApiBaseUrl()) ||
+    DEFAULT_API_BASE;
+  g.LOGIN_WEB_URL =
+    (typeof SecureDocConfig !== "undefined" && SecureDocConfig.getLoginWebUrl()) ||
+    LOGIN_WEB_URL;
+  g.getLoginWebUrl = getLoginWebUrl;
+  g.loginRequiredMessage = loginRequiredMessage;
+  g.getStoredSession = getStoredSession;
+  g.saveSession = saveSession;
+  g.clearSession = clearSession;
+  g.logoutSession = logoutSession;
+  g.ensureAuthSession = ensureAuthSession;
+  g.normalizeEmailAddress = normalizeEmailAddress;
+  g.loginWithPassword = loginWithPassword;
+  g.signupWithPassword = signupWithPassword;
+  g.sendSignupOtp = sendSignupOtp;
+  g.loginWithOAuth = loginWithOAuth;
+  g.fetchOAuthProviders = fetchOAuthProviders;
+  g.completeOAuthTicket = completeOAuthTicket;
+  g.checkSenderSubscription = checkSenderSubscription;
+  g.decryptOnly = decryptOnly;
+  g.extractDecryptedFileBase64 = extractDecryptedFileBase64;
+  g.guessDecryptedFileName = guessDecryptedFileName;
+  g.normalizeBaseUrl = normalizeBaseUrl;
+  g.apiRequest = apiRequest;
+})(typeof globalThis !== "undefined" ? globalThis : window);
 
-  if (ticket) {
-    try {
-      var raw = CacheService.getScriptCache().get("sds_compose_" + ticket);
-      CacheService.getScriptCache().remove("sds_compose_" + ticket);
-      if (raw) session = JSON.parse(raw);
-    } catch (eCache) {
-      session = null;
-    }
-  }
-  if (!session || !session.token) {
-    session = getWorkspaceSession_();
-  }
 
-  var template = HtmlService.createTemplateFromFile("Compose");
-  template.sessionJson = JSON.stringify(session || null);
-  var page = template
-    .evaluate()
-    .setTitle("SecureDocShare — Compose")
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
-  try {
-    page.setWidth(420).setHeight(640);
-  } catch (eSize) {}
-  return page;
-}
-
-function serveCachedDownload_(key) {
-  var raw = getDownloadCache_("sdl_" + key);
-  if (!raw) {
-    return HtmlService.createHtmlOutput(
-      "<!DOCTYPE html><html><body style='font-family:Arial;padding:16px'>" +
-        "<p><b>Download expired or Web app access is wrong.</b></p>" +
-        "<p>1) Open the mail in SecureDocShare again (decrypt refreshes the file).</p>" +
-        "<p>2) Redeploy Web app: <b>Execute as: Me</b>, <b>Who has access: Anyone</b>.</p>" +
-        "</body></html>"
-    ).setTitle("Download expired");
-  }
-  var meta = {};
-  try {
-    meta = JSON.parse(raw);
-  } catch (err) {
-    return HtmlService.createHtmlOutput("<p>Invalid download token.</p>");
-  }
-  var name = String(meta.n || "decrypted.bin").replace(/"/g, "");
-  var mime = String(meta.m || "application/octet-stream").replace(/"/g, "");
-  var b64 = String(meta.b || "");
-  var chunks = Number(meta.c || 0);
-  if (!b64 && chunks > 0) {
-    var parts = [];
-    var i;
-    for (i = 0; i < chunks; i++) {
-      var part = getDownloadCache_("sdl_" + key + "_" + i);
-      if (part == null) {
-        return HtmlService.createHtmlOutput(
-          "<p>Download data incomplete. Open the mail and decrypt again.</p>"
-        ).setTitle("Download failed");
-      }
-      parts.push(part);
-    }
-    b64 = parts.join("");
-  }
-  if (!b64) {
-    return HtmlService.createHtmlOutput("<p>No file data found.</p>").setTitle(
-      "Download failed"
-    );
-  }
-
-  // Minimal page: only triggers browser download of the decrypted file.
-  var html =
-    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Saving file</title></head>" +
-    "<body style='font-family:Arial,sans-serif;padding:20px;color:#333'>" +
-    "<p>Saving <b>" +
-    escapeHtml_(name) +
-    "</b> to your computer…</p>" +
-    "<p style='font-size:13px;color:#666'>If the file did not save, <a id='manual' href='#'>click here</a>.</p>" +
-    "<script>(function(){" +
-    "var b64=" +
-    JSON.stringify(b64) +
-    ",mime=" +
-    JSON.stringify(mime) +
-    ",name=" +
-    JSON.stringify(name) +
-    ";" +
-    "function save(){" +
-    "var bin=atob(b64),arr=new Uint8Array(bin.length);" +
-    "for(var i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);" +
-    "var blob=new Blob([arr],{type:mime||'application/octet-stream'});" +
-    "var url=URL.createObjectURL(blob);" +
-    "var a=document.createElement('a');a.href=url;a.download=name;" +
-    "document.body.appendChild(a);a.click();" +
-    "setTimeout(function(){URL.revokeObjectURL(url);},2000);" +
-    "return url;" +
-    "}" +
-    "var u=save();" +
-    "var m=document.getElementById('manual');" +
-    "if(m){m.onclick=function(ev){ev.preventDefault();m.href=save();m.download=name;};}" +
-    "})();</script></body></html>";
-  return HtmlService.createHtmlOutput(html)
-    .setTitle("Download " + name)
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
-}
-
-function include(filename) {
-  return HtmlService.createHtmlOutputFromFile(filename).getContent();
-}
+</script>
