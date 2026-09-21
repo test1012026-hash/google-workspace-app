@@ -1514,18 +1514,30 @@ function runComposeEncryptAndSendCore_(e) {
     };
   }
 
-  // Reply/forward: encrypt only the NEW text; decrypt parent sds. to clear text.
-  // Parent sdmeta.v1.… stays as-is in the quoted block.
+  // Reply/forward handling:
+  // - Decrypt any parent sds. with the signed-in user's keys
+  // - Strip old sdmeta (avoid duplicate / glued "testsdmeta")
+  // - Pure forward / empty new body: re-encrypt decrypted plain for the NEW To
+  // - Reply with new text: encrypt only the new text; append clear parent (no old meta)
   var split = splitComposeNewAndQuoted_(payload.message);
   var newMessage = String(split.newText || "").trim();
   var quotedBlock = String(split.quotedBlock || "").trim();
+  var sessionEmail =
+    (gate.email && String(gate.email)) ||
+    (getWorkspaceSession_() && getWorkspaceSession_().email) ||
+    "";
+  var subject = payload.subject || "Secure document";
+  var isForwardSubject = /^(fw|fwd)\s*:/i.test(String(subject).trim());
   var quotedClear = "";
+  var quotedAppendix = "";
+
+  // Body is only ciphertext (common on Forward with no markers).
+  if (!quotedBlock && /sds\./i.test(newMessage)) {
+    quotedBlock = newMessage;
+    newMessage = "";
+  }
 
   if (quotedBlock) {
-    var sessionEmail =
-      (gate.email && String(gate.email)) ||
-      (getWorkspaceSession_() && getWorkspaceSession_().email) ||
-      "";
     var quoteDec = decryptQuotedParentSds_(
       quotedBlock,
       gate.token,
@@ -1539,20 +1551,60 @@ function runComposeEncryptAndSendCore_(e) {
           "Could not decrypt the quoted parent message. Open the original mail, decrypt once, then try again.",
       };
     }
-    quotedClear = String(quoteDec.text || "").trim();
+    quotedClear = stripSecureDocMetadataBlock_(
+      String(quoteDec.text || "").trim()
+    );
   }
 
-  if (!newMessage) {
-    // Pure forward / empty reply body — still send an encrypted wrapper.
-    newMessage = quotedClear
-      ? "Forwarded message"
-      : String(payload.message || "").trim();
+  if (newMessage && /sds\./i.test(newMessage)) {
+    var newDec = decryptQuotedParentSds_(
+      newMessage,
+      gate.token,
+      sessionEmail
+    );
+    if (!newDec.ok) {
+      return {
+        ok: false,
+        error:
+          newDec.error ||
+          "Could not decrypt the message body before encrypting for the new recipient.",
+      };
+    }
+    newMessage = stripSecureDocMetadataBlock_(String(newDec.text || "").trim());
+  }
+
+  var messageToEncrypt = newMessage;
+  if (!messageToEncrypt) {
+    // Pure forward / empty reply: re-encrypt parent plain for the NEW recipient.
+    messageToEncrypt = extractForwardPlainMessage_(quotedClear);
+    quotedAppendix = "";
+  } else if (quotedClear) {
+    // Reply with new text: keep parent readable, without old metadata.
+    quotedAppendix = isForwardSubject
+      ? ""
+      : extractForwardPlainMessage_(quotedClear);
+    if (isForwardSubject) {
+      // Forward + typed note: encrypt note + parent plain together for new To.
+      var parentPlain = extractForwardPlainMessage_(quotedClear);
+      messageToEncrypt = parentPlain
+        ? messageToEncrypt + "\n\n" + parentPlain
+        : messageToEncrypt;
+      quotedAppendix = "";
+    }
+  }
+
+  if (!String(messageToEncrypt || "").trim()) {
+    return {
+      ok: false,
+      error:
+        "Nothing to encrypt. Add a message, or forward an encrypted mail you can decrypt.",
+    };
   }
 
   var enc = apiEncrypt_(
     payload.firstTo,
-    payload.subject,
-    newMessage,
+    subject,
+    messageToEncrypt,
     gate.token
   );
   if (!enc.ok) {
@@ -1561,10 +1613,9 @@ function runComposeEncryptAndSendCore_(e) {
 
   var cipher = enc.messageCipherText || "";
   var meta = enc.mailMetadata || null;
-  var bodyHtml = buildSecureComposeBodyHtml_(cipher, meta, quotedClear);
-  var bodyText = buildSecureComposeBodyText_(cipher, meta, quotedClear);
+  var bodyHtml = buildSecureComposeBodyHtml_(cipher, meta, quotedAppendix);
+  var bodyText = buildSecureComposeBodyText_(cipher, meta, quotedAppendix);
   var toHeader = payload.toJoined || payload.firstTo;
-  var subject = payload.subject || "Secure document";
   var oldDraftId =
     payload.matched && payload.matched.ok ? payload.matched.draftId || "" : "";
 
@@ -1926,8 +1977,8 @@ function splitComposeNewAndQuoted_(body) {
 }
 
 /**
- * Decrypt sds. tokens in quoted parent text → clear message.
- * Leaves sdmeta.v1.… / email: / uuid: lines unchanged.
+ * Decrypt sds. tokens in text → clear message.
+ * Ensures a blank line before any leftover metadata so we never get "testsdmeta…".
  * Uses the signed-in user's email (keys for the mail they received).
  */
 function decryptQuotedParentSds_(quotedBlock, authToken, recipientEmail) {
@@ -1971,11 +2022,72 @@ function decryptQuotedParentSds_(quotedBlock, authToken, recipientEmail) {
     }
     var plain = String(dec.message || "").trim();
     if (!plain) plain = "[Decrypted message was empty]";
+    var after = out.slice(span.end);
+    // Prevent "test" + "sdmeta…" → "testsdmeta…"
+    if (after && !/^\s/.test(after)) {
+      plain = plain + "\n\n";
+    } else if (after && /^\s*sdmeta\./i.test(after.replace(/^\s+/, ""))) {
+      plain = plain + "\n\n";
+    } else if (!/\n$/.test(plain) && /^\s*\n?\s*sdmeta\./i.test(after)) {
+      plain = plain + "\n\n";
+    }
     out = out.slice(0, span.start) + plain + out.slice(span.end);
     replaced += 1;
   }
 
   return { ok: true, text: out, decrypted: replaced > 0 };
+}
+
+/** Remove SecureDoc metadata blocks from plaintext (old recipient meta must not be forwarded). */
+function stripSecureDocMetadataBlock_(text) {
+  return String(text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/sdmeta\.v1\.[A-Za-z0-9_-]+/gi, "")
+    .replace(/^\s*email:\s*enc:v1:\S+\s*$/gim, "")
+    .replace(/^\s*uuid:\s*uid:v1:\S+\s*$/gim, "")
+    .replace(/^\s*email:\s*$/gim, "")
+    .replace(/^\s*uuid:\s*$/gim, "")
+    .replace(/^\s*Metadata\s*$/gim, "")
+    .replace(/^\s*error:\s*.+$/gim, "")
+    .replace(/To know more, visit our website:\s*https?:\/\/\S+/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * From a decrypted forward/reply quote, keep the human message only
+ * (drop Gmail "On … wrote:" / forwarded headers when possible).
+ */
+function extractForwardPlainMessage_(text) {
+  var t = stripSecureDocMetadataBlock_(text);
+  if (!t) return "";
+
+  // Drop leading Gmail quote attribution line, keep body after it.
+  var onWrote = /^(On .+wrote:\s*)/i.exec(t);
+  if (onWrote) {
+    t = t.slice(onWrote[0].length).trim();
+  }
+  t = t
+    .replace(/^[-_]{5,}\s*Forwarded message\s*[-_]{5,}\s*/i, "")
+    .replace(/^Begin forwarded message:\s*/i, "")
+    .replace(/^[-_]{5,}\s*Original Message\s*[-_]{5,}\s*/i, "")
+    .replace(/^From:\s.+\nDate:\s.+\nSubject:\s.+\nTo:\s.+\n+/i, "")
+    .trim();
+
+  // Quoted lines starting with ">"
+  if (/^>/m.test(t) && t.split("\n").every(function (line) {
+    return !String(line).trim() || /^\s*>/.test(line);
+  })) {
+    t = t
+      .split("\n")
+      .map(function (line) {
+        return String(line).replace(/^\s*>\s?/, "");
+      })
+      .join("\n")
+      .trim();
+  }
+
+  return stripSecureDocMetadataBlock_(t);
 }
 
 function saveWorkspaceSession(session) {
