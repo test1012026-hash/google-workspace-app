@@ -33,7 +33,7 @@ const ENCRYPT_ONLY_MESSAGES = {
   LOGIN_REQUIRED: "Login or an active subscription is required.",
   GMAIL_CONNECT: "Please connect Gmail, then try Encrypt data only again.",
   ALREADY_ENCRYPTED:
-    "This draft is already encrypted. Clear the message body, type a new message, wait for Gmail autosave, then try again.",
+    "Please check this draft is already encrypted. Clear the message body, type a new message, wait for Gmail autosave, then try again.",
   NOTHING_TO_ENCRYPT:
     "Nothing to encrypt. Add a message or file, wait for Gmail autosave, then try again.",
   FAILED: "Could not encrypt the draft.",
@@ -500,7 +500,7 @@ function buildGmailMessageCard_(e) {
 }
 
 /**
- * Encrypt data only result card — success or error message only.
+ * Encrypt data only result card — success/error message + Back to main page.
  * @param {string} kind
  * @param {string} message
  */
@@ -518,18 +518,49 @@ function buildEncryptOnlyStatusCard_(kind, message) {
       ? ENCRYPT_ONLY_MESSAGES.FAILED
       : "Could not encrypt the draft.";
 
-  return CardService.newCardBuilder()
-    .setHeader(cardHeader_("SecureDocShare", subtitle))
-    .addSection(
-      CardService.newCardSection().addWidget(
-        CardService.newTextParagraph().setText(
-          coloredStatusParagraphText_(
-            statusKind,
-            message || fallbackMessage
-          )
-        )
+  const section = CardService.newCardSection()
+    .addWidget(
+      CardService.newTextParagraph().setText(
+        coloredStatusParagraphText_(statusKind, message || fallbackMessage)
       )
     )
+    .addWidget(
+      CardService.newButtonSet().addButton(
+        CardService.newTextButton()
+          .setText("Back")
+          .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+          .setOnClickAction(
+            CardService.newAction().setFunctionName("onBackFromEncryptStatus_")
+          )
+      )
+    );
+
+  if (needsGmail) {
+    const valid = getValidWorkspaceAuth_();
+    const session = (valid && valid.session) || {};
+    const connect = session.token
+      ? apiGmailConnectUrl_(session.token)
+      : { ok: false };
+    if (connect.ok && connect.url) {
+      section.addWidget(
+        CardService.newButtonSet().addButton(
+          CardService.newTextButton()
+            .setText("Connect Gmail")
+            .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+            .setOpenLink(
+              CardService.newOpenLink()
+                .setUrl(connect.url)
+                .setOpenAs(CardService.OpenAs.FULL_SIZE)
+                .setOnClose(CardService.OnClose.RELOAD)
+            )
+        )
+      );
+    }
+  }
+
+  return CardService.newCardBuilder()
+    .setHeader(cardHeader_("SecureDocShare", subtitle))
+    .addSection(section)
     .build();
 }
 
@@ -1635,6 +1666,16 @@ function onCardBack_(e) {
 }
 
 function onDismissComposeStatus_(e) {
+  if (typeof clearComposeSidebarStatus_ === "function") {
+    clearComposeSidebarStatus_();
+  }
+  return CardService.newActionResponseBuilder()
+    .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
+    .build();
+}
+
+/** Back from Encrypt data only success/error → clear status and open main page. */
+function onBackFromEncryptStatus_(e) {
   if (typeof clearComposeSidebarStatus_ === "function") {
     clearComposeSidebarStatus_();
   }

@@ -50,7 +50,7 @@ function buildGmailMessageCard_(e) {
 }
 
 /**
- * Encrypt data only result card — success or error message only.
+ * Encrypt data only result card — success/error message + Back to main page.
  * @param {string} kind
  * @param {string} message
  */
@@ -68,18 +68,49 @@ function buildEncryptOnlyStatusCard_(kind, message) {
       ? ENCRYPT_ONLY_MESSAGES.FAILED
       : "Could not encrypt the draft.";
 
-  return CardService.newCardBuilder()
-    .setHeader(cardHeader_("SecureDocShare", subtitle))
-    .addSection(
-      CardService.newCardSection().addWidget(
-        CardService.newTextParagraph().setText(
-          coloredStatusParagraphText_(
-            statusKind,
-            message || fallbackMessage
-          )
-        )
+  const section = CardService.newCardSection()
+    .addWidget(
+      CardService.newTextParagraph().setText(
+        coloredStatusParagraphText_(statusKind, message || fallbackMessage)
       )
     )
+    .addWidget(
+      CardService.newButtonSet().addButton(
+        CardService.newTextButton()
+          .setText("Back")
+          .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+          .setOnClickAction(
+            CardService.newAction().setFunctionName("onBackFromEncryptStatus_")
+          )
+      )
+    );
+
+  if (needsGmail) {
+    const valid = getValidWorkspaceAuth_();
+    const session = (valid && valid.session) || {};
+    const connect = session.token
+      ? apiGmailConnectUrl_(session.token)
+      : { ok: false };
+    if (connect.ok && connect.url) {
+      section.addWidget(
+        CardService.newButtonSet().addButton(
+          CardService.newTextButton()
+            .setText("Connect Gmail")
+            .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+            .setOpenLink(
+              CardService.newOpenLink()
+                .setUrl(connect.url)
+                .setOpenAs(CardService.OpenAs.FULL_SIZE)
+                .setOnClose(CardService.OnClose.RELOAD)
+            )
+        )
+      );
+    }
+  }
+
+  return CardService.newCardBuilder()
+    .setHeader(cardHeader_("SecureDocShare", subtitle))
+    .addSection(section)
     .build();
 }
 

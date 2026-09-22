@@ -338,6 +338,16 @@ function onDismissComposeStatus_(e) {
     .build();
 }
 
+/** Back from Encrypt data only success/error → clear status and open main page. */
+function onBackFromEncryptStatus_(e) {
+  if (typeof clearComposeSidebarStatus_ === "function") {
+    clearComposeSidebarStatus_();
+  }
+  return CardService.newActionResponseBuilder()
+    .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
+    .build();
+}
+
 function getComposeDraftMeta_(e) {
   var gmail = (e && e.gmail) || {};
   var meta = (e && e.draftMetadata) || {};
