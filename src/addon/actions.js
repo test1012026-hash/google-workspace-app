@@ -378,16 +378,39 @@ function getComposeDraftMeta_(e) {
 
 function resolveComposeEncryptPayload_(e, gmailAccessToken, opts) {
   opts = opts || {};
+  const preferPlainBody = opts.preferPlainBody === true;
   const draftMeta = getComposeDraftMeta_(e);
   const toList =
     draftMeta.to && draftMeta.to.length ? draftMeta.to.slice() : [];
 
-  const matched = findMatchingGmailDraft_(
+  let matched = findMatchingGmailDraft_(
     toList,
     draftMeta.subject || "",
     gmailAccessToken,
-    { preferPlainBody: opts.preferPlainBody === true }
+    { preferPlainBody: preferPlainBody }
   );
+
+  // Compose toolbar passes To from METADATA. That often matches an older
+  // already-encrypted draft, while the open plain compose (same as sidebar)
+  // may not have To synced yet. Fall back to sidebar-style match (no To filter)
+  // so the first click encrypts the plain draft.
+  if (
+    preferPlainBody &&
+    matched &&
+    matched.ok &&
+    matched.isEncryptedBody &&
+    toList.length
+  ) {
+    const plainFallback = findMatchingGmailDraft_(
+      [],
+      draftMeta.subject || "",
+      gmailAccessToken,
+      { preferPlainBody: true }
+    );
+    if (plainFallback && plainFallback.ok && !plainFallback.isEncryptedBody) {
+      matched = plainFallback;
+    }
+  }
 
   let firstTo = "";
   if (toList.length) {
@@ -397,7 +420,9 @@ function resolveComposeEncryptPayload_(e, gmailAccessToken, opts) {
   }
 
   const subject =
-    (matched.ok && matched.subject) || draftMeta.subject || "";
+    (draftMeta.subject && String(draftMeta.subject).trim()) ||
+    (matched.ok && matched.subject) ||
+    "";
   const message = (matched.ok && matched.body) || "";
 
   const toJoined =

@@ -33,7 +33,7 @@ const ENCRYPT_ONLY_MESSAGES = {
   LOGIN_REQUIRED: "Login or an active subscription is required.",
   GMAIL_CONNECT: "Please connect Gmail, then try Encrypt data only again.",
   ALREADY_ENCRYPTED:
-    "Please check this draft is already encrypted. Clear the message body, type a new message, wait for Gmail autosave, then try again.",
+    "This draft is already encrypted. Please close the current compose window and check your Drafts folder. Wait for 1 minute first and check whether the draft is encrypted. If it is not encrypted, open a new compose window and try again.",
   NOTHING_TO_ENCRYPT:
     "Nothing to encrypt. Add a message or file, wait for Gmail autosave, then try again.",
   FAILED: "Could not encrypt the draft.",
@@ -1714,16 +1714,39 @@ function getComposeDraftMeta_(e) {
 
 function resolveComposeEncryptPayload_(e, gmailAccessToken, opts) {
   opts = opts || {};
+  const preferPlainBody = opts.preferPlainBody === true;
   const draftMeta = getComposeDraftMeta_(e);
   const toList =
     draftMeta.to && draftMeta.to.length ? draftMeta.to.slice() : [];
 
-  const matched = findMatchingGmailDraft_(
+  let matched = findMatchingGmailDraft_(
     toList,
     draftMeta.subject || "",
     gmailAccessToken,
-    { preferPlainBody: opts.preferPlainBody === true }
+    { preferPlainBody: preferPlainBody }
   );
+
+  // Compose toolbar passes To from METADATA. That often matches an older
+  // already-encrypted draft, while the open plain compose (same as sidebar)
+  // may not have To synced yet. Fall back to sidebar-style match (no To filter)
+  // so the first click encrypts the plain draft.
+  if (
+    preferPlainBody &&
+    matched &&
+    matched.ok &&
+    matched.isEncryptedBody &&
+    toList.length
+  ) {
+    const plainFallback = findMatchingGmailDraft_(
+      [],
+      draftMeta.subject || "",
+      gmailAccessToken,
+      { preferPlainBody: true }
+    );
+    if (plainFallback && plainFallback.ok && !plainFallback.isEncryptedBody) {
+      matched = plainFallback;
+    }
+  }
 
   let firstTo = "";
   if (toList.length) {
@@ -1733,7 +1756,9 @@ function resolveComposeEncryptPayload_(e, gmailAccessToken, opts) {
   }
 
   const subject =
-    (matched.ok && matched.subject) || draftMeta.subject || "";
+    (draftMeta.subject && String(draftMeta.subject).trim()) ||
+    (matched.ok && matched.subject) ||
+    "";
   const message = (matched.ok && matched.body) || "";
 
   const toJoined =
@@ -4077,8 +4102,35 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken, opts) {
 
   let best = pickBestFromDraftList_(drafts);
 
-  if (preferPlainBody && best && best.isEncryptedBody) {
-    Utilities.sleep(2000);
+  // Prefer plaintext: if To-filter only found encrypted drafts, widen search
+  // (same behavior as sidebar Encrypt data only).
+  if (preferPlainBody && best && best.isEncryptedBody && targets.length) {
+    Utilities.sleep(1500);
+    const listAgain = gmailApiRequest_(
+      "get",
+      "/gmail/v1/users/me/drafts?maxResults=40",
+      null,
+      accessToken
+    );
+    const again =
+      listAgain.ok && listAgain.data && listAgain.data.drafts
+        ? listAgain.data.drafts
+        : drafts;
+
+    const savedTargets = targets.slice();
+    targets.length = 0;
+    const wideBest = pickBestFromDraftList_(again);
+    targets.push.apply(targets, savedTargets);
+
+    if (wideBest && !wideBest.isEncryptedBody) {
+      best = wideBest;
+    } else {
+      const retryBest = pickBestFromDraftList_(again);
+      if (retryBest && !retryBest.isEncryptedBody) best = retryBest;
+      else if (retryBest) best = retryBest;
+    }
+  } else if (preferPlainBody && best && best.isEncryptedBody) {
+    Utilities.sleep(1500);
     const listAgain = gmailApiRequest_(
       "get",
       "/gmail/v1/users/me/drafts?maxResults=40",

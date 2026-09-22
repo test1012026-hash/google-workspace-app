@@ -498,8 +498,35 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken, opts) {
 
   let best = pickBestFromDraftList_(drafts);
 
-  if (preferPlainBody && best && best.isEncryptedBody) {
-    Utilities.sleep(2000);
+  // Prefer plaintext: if To-filter only found encrypted drafts, widen search
+  // (same behavior as sidebar Encrypt data only).
+  if (preferPlainBody && best && best.isEncryptedBody && targets.length) {
+    Utilities.sleep(1500);
+    const listAgain = gmailApiRequest_(
+      "get",
+      "/gmail/v1/users/me/drafts?maxResults=40",
+      null,
+      accessToken
+    );
+    const again =
+      listAgain.ok && listAgain.data && listAgain.data.drafts
+        ? listAgain.data.drafts
+        : drafts;
+
+    const savedTargets = targets.slice();
+    targets.length = 0;
+    const wideBest = pickBestFromDraftList_(again);
+    targets.push.apply(targets, savedTargets);
+
+    if (wideBest && !wideBest.isEncryptedBody) {
+      best = wideBest;
+    } else {
+      const retryBest = pickBestFromDraftList_(again);
+      if (retryBest && !retryBest.isEncryptedBody) best = retryBest;
+      else if (retryBest) best = retryBest;
+    }
+  } else if (preferPlainBody && best && best.isEncryptedBody) {
+    Utilities.sleep(1500);
     const listAgain = gmailApiRequest_(
       "get",
       "/gmail/v1/users/me/drafts?maxResults=40",
