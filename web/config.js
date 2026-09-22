@@ -5,8 +5,6 @@
     TERMS_URL: "https://admin-panel-amber-nine.vercel.app/terms",
     SESSION_STORAGE_KEY: "securedoc_workspace_session",
     OAUTH_POPUP_DONE_ORIGIN: "https://server-nine-rosy.vercel.app",
-    WEB_APP_EXEC_PATH:
-      "/macros/s/AKfycbzCvUVD8GnLvsGNpux6euGd2WJrYUmGXEE3qp-NK-emFZSFAvN5dPOkIumQLmgcm5RRVA/exec",
     LS_LOGIN_URL_KEY: "securedoc_login_url",
     LS_API_BASE_KEY: "securedoc_api_base",
   };
@@ -49,10 +47,6 @@
 
     getSessionStorageKey: function () {
       return ENV.SESSION_STORAGE_KEY;
-    },
-
-    getWebAppExecPath: function () {
-      return ENV.WEB_APP_EXEC_PATH;
     },
 
     ensureApiBase: ensureApiBase,

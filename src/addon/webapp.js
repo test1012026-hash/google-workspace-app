@@ -211,48 +211,11 @@ function doGet(e) {
       .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   }
 
-  // Compose & send modal from Gmail card — compose-only (uses add-on session).
-  var view = String(params.view || "");
-  var embed = String(params.embed || "");
-  if (view === "compose" || view === "encrypt" || embed === "1") {
-    return serveComposeModal_(params);
-  }
-
   // Must use Template so <?!= include(...) ?> in Index.html are evaluated.
   return HtmlService.createTemplateFromFile("Index")
     .evaluate()
     .setTitle("SecureDocShare Workspace")
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
-}
-
-/** Overlay compose UI — no login shell; session from ticket or UserProperties. */
-function serveComposeModal_(params) {
-  var session = null;
-  var ticket = String((params && params.compose_ticket) || "").trim();
-
-  if (ticket) {
-    try {
-      var raw = CacheService.getScriptCache().get("sds_compose_" + ticket);
-      CacheService.getScriptCache().remove("sds_compose_" + ticket);
-      if (raw) session = JSON.parse(raw);
-    } catch (eCache) {
-      session = null;
-    }
-  }
-  if (!session || !session.token) {
-    session = getWorkspaceSession_();
-  }
-
-  var template = HtmlService.createTemplateFromFile("Compose");
-  template.sessionJson = JSON.stringify(session || null);
-  var page = template
-    .evaluate()
-    .setTitle("SecureDocShare — Compose")
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
-  try {
-    page.setWidth(420).setHeight(640);
-  } catch (eSize) {}
-  return page;
 }
 
 function serveCachedDownload_(key) {

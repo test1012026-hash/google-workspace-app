@@ -89,14 +89,18 @@
         </div>
 
         <div id="compose-view" class="encrypt-result panel">
-          <p class="hint" id="compose-hint">
-            Type a name or email to search Google Contacts. Selected recipients appear as chips.
+          <p class="hint">
+            Enter a recipient email, subject, and message (or use Gmail draft Encrypt from the add-on).
           </p>
 
-          <label class="label">Recipient email</label>
-          <div id="recipient-input-root"></div>
-          <!-- Fallback when chips UI is unavailable -->
-          <input id="encrypt-to" class="field" type="email" style="display:none" aria-hidden="true" />
+          <label class="label" for="encrypt-to">Recipient email</label>
+          <input
+            id="encrypt-to"
+            class="field"
+            type="email"
+            placeholder="recipient@company.com"
+            autocomplete="email"
+          />
 
           <label class="label" for="encrypt-subject">Subject</label>
           <input
@@ -187,7 +191,6 @@
 
     <?!= include('Config'); ?>
     <?!= include('Common'); ?>
-    <?!= include('ComposeUi'); ?>
     <?!= include('GmailSend'); ?>
     <?!= include('App'); ?>
   </body>

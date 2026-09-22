@@ -337,20 +337,31 @@ function loadDraftEncryptFiles_(messageId, payload, accessToken) {
   return files;
 }
 
-function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
+/**
+ * Find the open compose draft.
+ * @param {string[]} toEmails
+ * @param {string} subjectHint
+ * @param {string} accessToken
+ * @param {{ preferPlainBody?: boolean }} opts
+ *   preferPlainBody (Encrypt data only): prefer plaintext drafts so first click
+ *   does not match an older already-encrypted draft.
+ */
+function findMatchingGmailDraft_(toEmails, subjectHint, accessToken, opts) {
+  opts = opts || {};
+  const preferPlainBody = opts.preferPlainBody === true;
   const targets = [];
   for (let i = 0; i < (toEmails || []).length; i++) {
-    const e = normalizeEmailAddress_(toEmails[i]);
-    if (e && targets.indexOf(e) < 0) targets.push(e);
+    const email = normalizeEmailAddress_(toEmails[i]);
+    if (email && targets.indexOf(email) < 0) targets.push(email);
   }
-  const subjectWant = String(subjectHint || "").trim().toLowerCase();
+  const subjectWant = String(subjectHint || "")
+    .trim()
+    .toLowerCase();
 
-  // Gmail often has not autosaved yet; also after a successful send the draft
-  // is deleted so a second click sees an empty list.
   let drafts = [];
   let listError = "";
-  const attempts = 3;
-  for (let attempt = 0; attempt < attempts; attempt++) {
+  const listAttempts = 3;
+  for (let attempt = 0; attempt < listAttempts; attempt++) {
     if (attempt > 0) {
       Utilities.sleep(1000);
     }
@@ -382,37 +393,24 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
     };
   }
 
-  let best = null;
-  for (let i = 0; i < drafts.length; i++) {
-    const id = drafts[i] && drafts[i].id;
-    if (!id) continue;
-    const full = gmailApiRequest_(
-      "get",
-      "/gmail/v1/users/me/drafts/" + encodeURIComponent(id) + "?format=full",
-      null,
-      accessToken
-    );
-    if (!full.ok) continue;
-    const draftObj = full.data || {};
-    const msg = draftObj.message || {};
-    const payload = msg.payload || {};
-    const headers = payload.headers || [];
+  function scoreDraftCandidate_(draftObj, msg, payload, headers, body) {
     const toHdr = getMimeHeader_(headers, "To");
     const subj = getMimeHeader_(headers, "Subject");
     const draftTos = extractEmailsFromHeader_(toHdr);
     let score = 0;
 
     if (targets.length) {
-      if (!emailsOverlap_(targets, draftTos)) continue;
+      if (!emailsOverlap_(targets, draftTos)) return null;
       score += 10;
     } else if (draftTos.length) {
-      // Reply/forward: compose event often omits To — still match drafts that have recipients.
       score += 8;
     } else {
       score += 1;
     }
 
-    const subjNorm = String(subj || "").trim().toLowerCase();
+    const subjNorm = String(subj || "")
+      .trim()
+      .toLowerCase();
     if (subjectWant && subjNorm === subjectWant) {
       score += 5;
     } else if (
@@ -424,15 +422,16 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
       score += 2;
     }
 
-    // Prefer drafts that look like the open reply (have a body).
-    const body = extractMessagePlainBody_(payload);
     if (body && body.length > 0) score += 1;
-    if (/sds\./i.test(body) || /On .+wrote:/i.test(body)) score += 2;
 
-    const candidate = {
+    const isEncryptedBody = /sds\./i.test(body || "");
+    const internalDate = Number(msg.internalDate || 0);
+
+    return {
       ok: true,
-      draftId: draftObj.id || id,
+      draftId: draftObj.id || "",
       messageId: msg.id || "",
+      threadId: msg.threadId || "",
       toHeader: toHdr,
       toEmails: draftTos.length ? draftTos : targets,
       subject: subj || "",
@@ -441,12 +440,77 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
       bccHeader: getMimeHeader_(headers, "Bcc"),
       payload: payload,
       score: score,
+      internalDate: internalDate,
+      isEncryptedBody: isEncryptedBody,
     };
+  }
 
-    if (!best || candidate.score > best.score) {
-      best = candidate;
+  function compareDraftRank_(a, b) {
+    if (a.score !== b.score) return b.score - a.score;
+    return b.internalDate - a.internalDate;
+  }
+
+  function pickBestFromDraftList_(draftList) {
+    const candidates = [];
+    for (let i = 0; i < draftList.length; i++) {
+      const id = draftList[i] && draftList[i].id;
+      if (!id) continue;
+      const full = gmailApiRequest_(
+        "get",
+        "/gmail/v1/users/me/drafts/" + encodeURIComponent(id) + "?format=full",
+        null,
+        accessToken
+      );
+      if (!full.ok) continue;
+      const draftObj = full.data || {};
+      const msg = draftObj.message || {};
+      const payload = msg.payload || {};
+      const headers = payload.headers || [];
+      const body = extractMessagePlainBody_(payload);
+      const candidate = scoreDraftCandidate_(
+        draftObj,
+        msg,
+        payload,
+        headers,
+        body
+      );
+      if (!candidate) continue;
+      candidate.draftId = draftObj.id || id;
+      candidates.push(candidate);
     }
-    if (candidate.score >= 15) break;
+
+    if (!candidates.length) return null;
+
+    // Encrypt data only: if any plaintext draft matches, never pick encrypted.
+    if (preferPlainBody) {
+      const plainDrafts = candidates.filter(function (c) {
+        return !c.isEncryptedBody;
+      });
+      if (plainDrafts.length) {
+        plainDrafts.sort(compareDraftRank_);
+        return plainDrafts[0];
+      }
+    }
+
+    candidates.sort(compareDraftRank_);
+    return candidates[0];
+  }
+
+  let best = pickBestFromDraftList_(drafts);
+
+  if (preferPlainBody && best && best.isEncryptedBody) {
+    Utilities.sleep(2000);
+    const listAgain = gmailApiRequest_(
+      "get",
+      "/gmail/v1/users/me/drafts?maxResults=40",
+      null,
+      accessToken
+    );
+    if (listAgain.ok) {
+      const again = (listAgain.data && listAgain.data.drafts) || [];
+      const retryBest = pickBestFromDraftList_(again);
+      if (retryBest) best = retryBest;
+    }
   }
 
   if (!best) {
@@ -594,6 +658,93 @@ function gmailDraftCreate_(options, accessToken) {
     { message: { raw: raw } },
     accessToken
   );
+}
+
+/**
+ * Update an existing draft in place (Gmail drafts.update).
+ * Same draft id — used by Encrypt data only.
+ */
+function gmailDraftUpdate_(draftId, options, accessToken, draftMeta) {
+  if (!draftId) {
+    return { ok: false, error: "Draft id missing." };
+  }
+  draftMeta = draftMeta || {};
+  const rfc822 = buildRfc822EncryptedMime_(options);
+  const raw = encodeRawMime_(rfc822);
+  const message = { raw: raw };
+  if (draftMeta.messageId) message.id = String(draftMeta.messageId);
+  if (draftMeta.threadId) message.threadId = String(draftMeta.threadId);
+  return gmailApiRequest_(
+    "put",
+    "/gmail/v1/users/me/drafts/" + encodeURIComponent(draftId),
+    {
+      id: draftId,
+      message: message,
+    },
+    accessToken
+  );
+}
+
+/**
+ * Encrypt-only: prefer drafts.update on the open draft.
+ * Falls back to create + delete old only if update is not possible.
+ */
+function gmailReplaceDraftWithEncrypted_(oldDraftId, mimeOpts, accessToken, draftMeta) {
+  if (oldDraftId) {
+    const updated = gmailDraftUpdate_(
+      oldDraftId,
+      mimeOpts,
+      accessToken,
+      draftMeta || {}
+    );
+    if (updated.ok) {
+      return {
+        ok: true,
+        draftId: oldDraftId,
+        updated: true,
+        created: false,
+        oldDeleted: false,
+        error: "",
+      };
+    }
+  }
+
+  const created = gmailDraftCreate_(mimeOpts, accessToken);
+  if (!created.ok || !created.data) {
+    return {
+      ok: false,
+      draftId: "",
+      updated: false,
+      created: false,
+      oldDeleted: false,
+      error:
+        (oldDraftId ? "Could not update draft; create also failed. " : "") +
+        (created.error || "Could not create encrypted draft."),
+    };
+  }
+
+  const newDraftId = (created.data && created.data.id) || "";
+  let oldDeleted = false;
+  let deleteError = "";
+  if (oldDraftId && oldDraftId !== newDraftId) {
+    const del = gmailDraftDelete_(oldDraftId, accessToken);
+    if (del.ok) {
+      oldDeleted = true;
+    } else {
+      deleteError =
+        del.error ||
+        "Encrypted draft created, but the old plaintext draft could not be deleted.";
+    }
+  }
+
+  return {
+    ok: true,
+    draftId: newDraftId,
+    updated: false,
+    created: true,
+    oldDeleted: oldDeleted,
+    error: deleteError,
+  };
 }
 
 /** Send a draft (Gmail removes that draft after send). */

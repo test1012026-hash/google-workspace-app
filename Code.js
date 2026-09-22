@@ -25,6 +25,21 @@ const GOOGLE_OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/gmail.compose",
 ];
 
+/** User-facing Encrypt data only messages. */
+const ENCRYPT_ONLY_MESSAGES = {
+  SUCCESS:
+    "Draft encrypted (not sent). Please close the current compose and check your drafts. If the mail is not encrypted, wait 1 minute and check again.",
+  SIGN_IN: "Please sign in to SecureDocShare first.",
+  LOGIN_REQUIRED: "Login or an active subscription is required.",
+  GMAIL_CONNECT: "Please connect Gmail, then try Encrypt data only again.",
+  ALREADY_ENCRYPTED:
+    "This draft is already encrypted. Clear the message body, type a new message, wait for Gmail autosave, then try again.",
+  NOTHING_TO_ENCRYPT:
+    "Nothing to encrypt. Add a message or file, wait for Gmail autosave, then try again.",
+  FAILED: "Could not encrypt the draft.",
+  UNEXPECTED: "Encrypt failed.",
+};
+
 function onHomepage(e) {
   return buildMainCard_(e);
 }
@@ -38,11 +53,40 @@ function onGmailMessage(e) {
 }
 
 /**
- * Not registered (composeTrigger removed). Gmail always opens a card modal for
- * compose selectActions — Encrypt & send lives on the sidebar button instead.
+ * Compose toolbar icon (below Send). Registered via gmail.composeTrigger.
+ * Must return a Card (ActionResponse causes "Content can't be loaded").
+ * Runs Encrypt data only — does not send.
  */
 function onGmailCompose(e) {
-  return onSidebarEncryptAndSend_(e);
+  try {
+    const status = getEncryptOnlyStatus_(e || {});
+    try {
+      saveComposeSidebarStatus_(status.kind, status.message);
+    } catch (_saveErr) {}
+    return buildEncryptOnlyStatusCard_(status.kind, status.message);
+  } catch (err) {
+    const errorMessage =
+      ENCRYPT_ONLY_MESSAGES.UNEXPECTED +
+      " " +
+      String(err && err.message ? err.message : err);
+    try {
+      saveComposeSidebarStatus_("error", errorMessage);
+    } catch (_saveErr) {}
+    try {
+      return buildEncryptOnlyStatusCard_("error", errorMessage);
+    } catch (_cardErr) {
+      return CardService.newCardBuilder()
+        .setHeader(cardHeader_("SecureDocShare", "Error"))
+        .addSection(
+          CardService.newCardSection().addWidget(
+            CardService.newTextParagraph().setText(
+              coloredStatusParagraphText_("error", errorMessage)
+            )
+          )
+        )
+        .build();
+    }
+  }
 }
 
 /**
@@ -307,6 +351,65 @@ function cardHeader_(title, subtitle) {
     .setSubtitle(subtitle || "Encrypt · Decrypt · Secure mail");
 }
 
+/** Status colors for CardService text (HTML font color). */
+const STATUS_COLOR = {
+  success: "#188038",
+  error: "#d93025",
+  info: "#1a73e8",
+  working: "#1a73e8",
+  need_gmail: "#1a73e8",
+};
+
+function escapeCardHtml_(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/\n/g, "<br>");
+}
+
+/**
+ * Map status kind → success (green) | error (red) | info (blue).
+ * @param {string} kind
+ * @returns {"success"|"error"|"info"}
+ */
+function statusToneFromKind_(kind) {
+  const k = String(kind || "");
+  if (k === "encrypted" || k === "success") return "success";
+  if (k === "error") return "error";
+  return "info";
+}
+
+/**
+ * Colored status title + body for TextParagraph (green / red / blue).
+ * @param {string} kind
+ * @param {string} message
+ */
+function coloredStatusParagraphText_(kind, message) {
+  const tone = statusToneFromKind_(kind);
+  const color = STATUS_COLOR[tone] || STATUS_COLOR.info;
+  let title = "Status";
+  if (tone === "success") title = "✔ SUCCESS";
+  else if (tone === "error") title = "✖ ERROR";
+  else if (kind === "need_gmail") title = "Connect Gmail";
+  else if (kind === "working") title = "Working…";
+  else title = "ℹ INFO";
+
+  const body = escapeCardHtml_(message);
+  return (
+    '<font color="' +
+    color +
+    '"><b>' +
+    title +
+    "</b></font><br><font color=\"" +
+    color +
+    '">' +
+    body +
+    "</font>"
+  );
+}
+
 function statusRow_(text, ok) {
   return CardService.newDecoratedText()
     .setText(String(text || ""))
@@ -396,6 +499,45 @@ function buildGmailMessageCard_(e) {
   return buildMainCard_(e);
 }
 
+/**
+ * Encrypt data only result card — success or error message only.
+ * @param {string} kind
+ * @param {string} message
+ */
+function buildEncryptOnlyStatusCard_(kind, message) {
+  const statusKind = String(kind || "error");
+  const isSuccess = statusKind === "encrypted" || statusKind === "success";
+  const needsGmail = statusKind === "need_gmail";
+  const subtitle = isSuccess
+    ? "Encrypted"
+    : needsGmail
+      ? "Connect Gmail"
+      : "Error";
+  const fallbackMessage =
+    typeof ENCRYPT_ONLY_MESSAGES !== "undefined"
+      ? ENCRYPT_ONLY_MESSAGES.FAILED
+      : "Could not encrypt the draft.";
+
+  return CardService.newCardBuilder()
+    .setHeader(cardHeader_("SecureDocShare", subtitle))
+    .addSection(
+      CardService.newCardSection().addWidget(
+        CardService.newTextParagraph().setText(
+          coloredStatusParagraphText_(
+            statusKind,
+            message || fallbackMessage
+          )
+        )
+      )
+    )
+    .build();
+}
+
+/** @deprecated Use buildEncryptOnlyStatusCard_ */
+function buildEncryptOnlyResultCard_(kind, message) {
+  return buildEncryptOnlyStatusCard_(kind, message);
+}
+
 /** Side panel: login screen OR tools (never tools without auth). */
 function buildMainCard_(e) {
   var valid = getValidWorkspaceAuth_();
@@ -413,7 +555,8 @@ function buildMainCard_(e) {
       ? peekComposeSidebarStatus_()
       : null;
   var subtitle = "Ready";
-  if (status && status.kind === "success") subtitle = "Sent";
+  if (status && status.kind === "encrypted") subtitle = "Encrypted";
+  else if (status && status.kind === "success") subtitle = "Sent";
   else if (status && status.kind === "error") subtitle = "Error";
   else if (status && status.kind === "working") subtitle = "Working…";
   else if (status && status.kind === "need_gmail") subtitle = "Connect Gmail";
@@ -423,21 +566,11 @@ function buildMainCard_(e) {
   );
 
   if (status && status.message) {
-    var statusHeader =
-      status.kind === "success"
-        ? "✔ SUCCESS"
-        : status.kind === "error"
-          ? "✖ ERROR"
-          : status.kind === "need_gmail"
-            ? "Connect Gmail"
-            : status.kind === "working"
-              ? "Working…"
-              : "Status";
-    var statusSection = CardService.newCardSection()
-      .setHeader(statusHeader)
-      .addWidget(
-        CardService.newTextParagraph().setText(String(status.message))
-      );
+    var statusSection = CardService.newCardSection().addWidget(
+      CardService.newTextParagraph().setText(
+        coloredStatusParagraphText_(status.kind, status.message)
+      )
+    );
 
     if (status.kind === "need_gmail") {
       var session = valid.session || {};
@@ -642,8 +775,17 @@ function buildSignedInSection_(session, prefetchedAuth) {
         )
     )
     .addWidget(
+      CardService.newButtonSet().addButton(
+        CardService.newTextButton()
+          .setText("Encrypt data only")
+          .setOnClickAction(
+            CardService.newAction().setFunctionName("onSidebarEncryptOnly_")
+          )
+      )
+    )
+    .addWidget(
       CardService.newTextParagraph().setText(
-        "Uses your open Gmail draft. Progress and result stay in this sidebar."
+        "Encrypt data only updates your open draft (no send). Encrypt & send encrypts and sends."
       )
     )
     .addWidget(
@@ -1529,28 +1671,31 @@ function getComposeDraftMeta_(e) {
   };
 }
 
-function resolveComposeEncryptPayload_(e, gmailAccessToken) {
-  var draftMeta = getComposeDraftMeta_(e);
-  var toList = (draftMeta.to && draftMeta.to.length) ? draftMeta.to.slice() : [];
+function resolveComposeEncryptPayload_(e, gmailAccessToken, opts) {
+  opts = opts || {};
+  const draftMeta = getComposeDraftMeta_(e);
+  const toList =
+    draftMeta.to && draftMeta.to.length ? draftMeta.to.slice() : [];
 
-  var matched = findMatchingGmailDraft_(
+  const matched = findMatchingGmailDraft_(
     toList,
     draftMeta.subject || "",
-    gmailAccessToken
+    gmailAccessToken,
+    { preferPlainBody: opts.preferPlainBody === true }
   );
 
-  var firstTo = "";
+  let firstTo = "";
   if (toList.length) {
     firstTo = normalizeEmailAddress_(toList[0]) || String(toList[0]).trim();
   } else if (matched.ok && matched.toEmails && matched.toEmails.length) {
     firstTo = matched.toEmails[0];
   }
 
-  var subject =
+  const subject =
     (matched.ok && matched.subject) || draftMeta.subject || "";
-  var message = (matched.ok && matched.body) || "";
+  const message = (matched.ok && matched.body) || "";
 
-  var toJoined =
+  const toJoined =
     toList.join(", ") ||
     (matched.ok && matched.toHeader) ||
     firstTo;
@@ -1646,7 +1791,7 @@ function runComposeEncryptAndSendCore_(e) {
   }
 
   try {
-    var result = runComposeEncryptAndSendCoreUnlocked_(e);
+    var result = runComposeEncryptAndSendCoreUnlocked_(e, { encryptOnly: false });
     if (!result.ok && isMissingDraftError_(result)) {
       var recent = getRecentComposeSendSuccess_(
         result.firstTo || earlyTo,
@@ -1676,7 +1821,30 @@ function runComposeEncryptAndSendCore_(e) {
   }
 }
 
-function runComposeEncryptAndSendCoreUnlocked_(e) {
+/** Encrypt draft body and update via Gmail drafts.update — does not send. */
+function runComposeEncryptOnlyCore_(e) {
+  var lock = LockService.getUserLock();
+  var gotLock = false;
+  try {
+    gotLock = lock.tryLock(45000);
+  } catch (eLock) {
+    gotLock = false;
+  }
+  try {
+    return runComposeEncryptAndSendCoreUnlocked_(e, { encryptOnly: true });
+  } finally {
+    if (gotLock) {
+      try {
+        lock.releaseLock();
+      } catch (eRel) {}
+    }
+  }
+}
+
+function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
+  opts = opts || {};
+  var encryptOnly = opts.encryptOnly === true;
+
   var gate = verifyLoginAndSubscription_();
   if (!gate.ok) {
     return {
@@ -1698,8 +1866,10 @@ function runComposeEncryptAndSendCoreUnlocked_(e) {
     };
   }
 
-  var accessToken = tokenRes.accessToken;
-  var payload = resolveComposeEncryptPayload_(e, accessToken);
+  const accessToken = tokenRes.accessToken;
+  const payload = resolveComposeEncryptPayload_(e, accessToken, {
+    preferPlainBody: encryptOnly,
+  });
   if (
     payload.matched &&
     payload.matched.ok === false &&
@@ -1759,91 +1929,120 @@ function runComposeEncryptAndSendCoreUnlocked_(e) {
     };
   }
 
-  // Reply/forward handling:
+  // Reply/forward handling (Encrypt & send only):
   // - Decrypt any parent sds. with the signed-in user's keys
   // - Strip old sdmeta (avoid duplicate / glued "testsdmeta")
   // - Pure forward / empty new body: re-encrypt decrypted plain for the NEW To
   // - Reply with new text: encrypt only the new text; append clear parent (no old meta)
-  var split = splitComposeNewAndQuoted_(payload.message || "");
-  var newMessage = String(split.newText || "").trim();
-  var quotedBlock = String(split.quotedBlock || "").trim();
-  var sessionEmail =
-    (gate.email && String(gate.email)) ||
-    (getWorkspaceSession_() && getWorkspaceSession_().email) ||
-    "";
-  var subject = payload.subject || "Secure document";
-  var isForwardSubject = /^(fw|fwd)\s*:/i.test(String(subject).trim());
-  var quotedClear = "";
-  var quotedAppendix = "";
+  // Encrypt data only: never decrypt — encrypt plain body/file only.
+  let messageToEncrypt = "";
+  let quotedAppendix = "";
+  const subject = payload.subject || "Secure document";
 
-  // Body is only ciphertext (common on Forward with no markers).
-  if (!quotedBlock && /sds\./i.test(newMessage)) {
-    quotedBlock = newMessage;
-    newMessage = "";
-  }
-
-  if (quotedBlock) {
-    var quoteDec = decryptQuotedParentSds_(
-      quotedBlock,
-      gate.token,
-      sessionEmail
-    );
-    if (!quoteDec.ok) {
+  if (encryptOnly) {
+    let plainBody = String(payload.message || "").trim();
+    if (/sds\./i.test(plainBody)) {
+      const splitBody = splitComposeNewAndQuoted_(plainBody);
+      const newPlainText = String(splitBody.newText || "").trim();
+      if (newPlainText && !/sds\./i.test(newPlainText)) {
+        plainBody = newPlainText;
+      } else {
+        return {
+          ok: false,
+          error: ENCRYPT_ONLY_MESSAGES.ALREADY_ENCRYPTED,
+          code: "ALREADY_ENCRYPTED",
+        };
+      }
+    }
+    messageToEncrypt = plainBody;
+    if (!String(messageToEncrypt || "").trim() && !fileToEncrypt) {
       return {
         ok: false,
-        error:
-          quoteDec.error ||
-          "Could not decrypt the quoted parent message. Open the original mail, decrypt once, then try again.",
+        error: ENCRYPT_ONLY_MESSAGES.NOTHING_TO_ENCRYPT,
       };
     }
-    quotedClear = stripSecureDocMetadataBlock_(
-      String(quoteDec.text || "").trim()
-    );
-  }
+  } else {
+    var split = splitComposeNewAndQuoted_(payload.message || "");
+    var newMessage = String(split.newText || "").trim();
+    var quotedBlock = String(split.quotedBlock || "").trim();
+    var sessionEmail =
+      (gate.email && String(gate.email)) ||
+      (getWorkspaceSession_() && getWorkspaceSession_().email) ||
+      "";
+    var isForwardSubject = /^(fw|fwd)\s*:/i.test(String(subject).trim());
+    var quotedClear = "";
 
-  if (newMessage && /sds\./i.test(newMessage)) {
-    var newDec = decryptQuotedParentSds_(
-      newMessage,
-      gate.token,
-      sessionEmail
-    );
-    if (!newDec.ok) {
-      return {
-        ok: false,
-        error:
-          newDec.error ||
-          "Could not decrypt the message body before encrypting for the new recipient.",
-      };
+    // Body is only ciphertext (common on Forward with no markers).
+    if (!quotedBlock && /sds\./i.test(newMessage)) {
+      quotedBlock = newMessage;
+      newMessage = "";
     }
-    newMessage = stripSecureDocMetadataBlock_(String(newDec.text || "").trim());
-  }
 
-  var messageToEncrypt = newMessage;
-  if (!messageToEncrypt) {
-    // Pure forward / empty reply: re-encrypt parent plain for the NEW recipient.
-    messageToEncrypt = extractForwardPlainMessage_(quotedClear);
-    quotedAppendix = "";
-  } else if (quotedClear) {
-    // Reply with new text: keep parent readable, without old metadata.
-    quotedAppendix = isForwardSubject
-      ? ""
-      : extractForwardPlainMessage_(quotedClear);
-    if (isForwardSubject) {
-      // Forward + typed note: encrypt note + parent plain together for new To.
-      var parentPlain = extractForwardPlainMessage_(quotedClear);
-      messageToEncrypt = parentPlain
-        ? messageToEncrypt + "\n\n" + parentPlain
-        : messageToEncrypt;
+    if (quotedBlock) {
+      var quoteDec = decryptQuotedParentSds_(
+        quotedBlock,
+        gate.token,
+        sessionEmail
+      );
+      if (!quoteDec.ok) {
+        return {
+          ok: false,
+          error:
+            quoteDec.error ||
+            "Could not decrypt the quoted parent message. Open the original mail, decrypt once, then try again.",
+        };
+      }
+      quotedClear = stripSecureDocMetadataBlock_(
+        String(quoteDec.text || "").trim()
+      );
+    }
+
+    if (newMessage && /sds\./i.test(newMessage)) {
+      var newDec = decryptQuotedParentSds_(
+        newMessage,
+        gate.token,
+        sessionEmail
+      );
+      if (!newDec.ok) {
+        return {
+          ok: false,
+          error:
+            newDec.error ||
+            "Could not decrypt the message body before encrypting for the new recipient.",
+        };
+      }
+      newMessage = stripSecureDocMetadataBlock_(
+        String(newDec.text || "").trim()
+      );
+    }
+
+    messageToEncrypt = newMessage;
+    if (!messageToEncrypt) {
+      // Pure forward / empty reply: re-encrypt parent plain for the NEW recipient.
+      messageToEncrypt = extractForwardPlainMessage_(quotedClear);
       quotedAppendix = "";
+    } else if (quotedClear) {
+      // Reply with new text: keep parent readable, without old metadata.
+      quotedAppendix = isForwardSubject
+        ? ""
+        : extractForwardPlainMessage_(quotedClear);
+      if (isForwardSubject) {
+        // Forward + typed note: encrypt note + parent plain together for new To.
+        var parentPlain = extractForwardPlainMessage_(quotedClear);
+        messageToEncrypt = parentPlain
+          ? messageToEncrypt + "\n\n" + parentPlain
+          : messageToEncrypt;
+        quotedAppendix = "";
+      }
     }
-  }
 
-  if (!String(messageToEncrypt || "").trim() && !fileToEncrypt) {
-    return {
-      ok: false,
-      error:
-        "Nothing to encrypt. Add a message or file, or forward an encrypted mail you can decrypt.",
-    };
+    if (!String(messageToEncrypt || "").trim() && !fileToEncrypt) {
+      return {
+        ok: false,
+        error:
+          "Nothing to encrypt. Add a message or file, or forward an encrypted mail you can decrypt.",
+      };
+    }
   }
 
   var fileOpts = null;
@@ -1926,7 +2125,7 @@ function runComposeEncryptAndSendCoreUnlocked_(e) {
   if (!cipher && !encAttB64) {
     return {
       ok: false,
-      error: "Encrypt returned no message and no file. Nothing was sent.",
+      error: "Encrypt returned no message and no file. Nothing was saved.",
     };
   }
 
@@ -1947,6 +2146,55 @@ function runComposeEncryptAndSendCoreUnlocked_(e) {
     attachmentName: encAttB64 ? encAttName : "",
     attachmentBase64: encAttB64 || "",
   };
+
+  // Encrypt data only: update open draft (no send).
+  if (encryptOnly) {
+    if (!oldDraftId) {
+      return {
+        ok: false,
+        error:
+          "No open draft found. Keep compose open, wait for autosave, then try again.",
+        code: "NO_DRAFT_MATCH",
+      };
+    }
+    var draftMeta = {
+      messageId:
+        payload.matched && payload.matched.ok
+          ? payload.matched.messageId || ""
+          : "",
+      threadId:
+        payload.matched && payload.matched.ok
+          ? payload.matched.threadId || ""
+          : "",
+    };
+    var replaced = gmailReplaceDraftWithEncrypted_(
+      oldDraftId,
+      mimeOpts,
+      accessToken,
+      draftMeta
+    );
+    if (!replaced.ok) {
+      return {
+        ok: false,
+        error: replaced.error || "Could not update draft with encrypted body.",
+      };
+    }
+    return {
+      ok: true,
+      sent: false,
+      encryptedOnly: true,
+      draftUpdated: Boolean(replaced.updated),
+      draftCreated: Boolean(replaced.created),
+      oldDraftDeleted: Boolean(replaced.oldDeleted),
+      warning: replaced.error || "",
+      firstTo: payload.firstTo,
+      subject: subject,
+      bodyHtml: bodyHtml,
+      bodyText: bodyText,
+      cipher: cipher,
+      draftId: replaced.draftId || oldDraftId,
+    };
+  }
 
   // 1) Create encrypted draft → 2) send → 3) delete plaintext draft
   var flow = gmailCreateEncryptedDraftSendAndCleanup_(
@@ -2068,7 +2316,7 @@ function clearComposeSidebarStatus_() {
 function finishComposeInSidebar_(e, kind, message) {
   saveComposeSidebarStatus_(kind, message);
   var toast = String(message || "").replace(/\n/g, " ").slice(0, 220);
-  if (kind === "success") toast = "✔ " + toast;
+  if (kind === "success" || kind === "encrypted") toast = "✔ " + toast;
   else if (kind === "error") toast = "✖ " + toast;
   else if (kind === "need_gmail") toast = "Connect Gmail to continue.";
 
@@ -2185,6 +2433,117 @@ function onSidebarEncryptAndSend_(e) {
   return finishComposeSendAndCloseCompose_(e, okMsg);
 }
 
+/**
+ * Build Encrypt data only status: { kind, message }.
+ * @param {Object} event — compose event (draft METADATA) or empty for sidebar.
+ */
+function getEncryptOnlyStatus_(event) {
+  const auth = getValidWorkspaceAuth_();
+  if (!auth) {
+    return {
+      kind: "error",
+      message: ENCRYPT_ONLY_MESSAGES.SIGN_IN,
+    };
+  }
+
+  let encryptResult;
+  try {
+    encryptResult = runComposeEncryptOnlyCore_(event || {});
+  } catch (err) {
+    return {
+      kind: "error",
+      message:
+        ENCRYPT_ONLY_MESSAGES.UNEXPECTED +
+        " " +
+        String(err && err.message ? err.message : err),
+    };
+  }
+
+  if (encryptResult.needLogin) {
+    return {
+      kind: "error",
+      message: encryptResult.error || ENCRYPT_ONLY_MESSAGES.LOGIN_REQUIRED,
+    };
+  }
+
+  if (
+    encryptResult.needGmailConnect ||
+    encryptResult.code === "GMAIL_NOT_CONNECTED" ||
+    /Connect Gmail|Gmail not connected|GMAIL_NOT_CONNECTED/i.test(
+      String(encryptResult.error || "")
+    )
+  ) {
+    return {
+      kind: "need_gmail",
+      message: encryptResult.error || ENCRYPT_ONLY_MESSAGES.GMAIL_CONNECT,
+    };
+  }
+
+  if (!encryptResult.ok || !encryptResult.encryptedOnly) {
+    let errorMessage = String(
+      encryptResult.error || ENCRYPT_ONLY_MESSAGES.FAILED
+    );
+    if (/DECRYPT|decrypt|recipient UUID/i.test(errorMessage)) {
+      errorMessage = ENCRYPT_ONLY_MESSAGES.ALREADY_ENCRYPTED;
+    }
+    return {
+      kind: "error",
+      message: errorMessage,
+    };
+  }
+
+  let successMessage = ENCRYPT_ONLY_MESSAGES.SUCCESS;
+  if (encryptResult.warning) {
+    successMessage += "\n" + String(encryptResult.warning);
+  }
+  return { kind: "encrypted", message: successMessage };
+}
+
+/** @deprecated Use getEncryptOnlyStatus_ */
+function runEncryptOnlyOutcome_(e) {
+  return getEncryptOnlyStatus_(e);
+}
+
+function formatEncryptOnlyToast_(kind, message) {
+  const toastText = String(message || "")
+    .replace(/\n/g, " ")
+    .slice(0, 220);
+  if (kind === "encrypted" || kind === "success") {
+    return "✔ " + toastText;
+  }
+  if (kind === "error") {
+    return "✖ " + toastText;
+  }
+  if (kind === "need_gmail") {
+    return ENCRYPT_ONLY_MESSAGES.GMAIL_CONNECT;
+  }
+  return toastText;
+}
+
+/**
+ * Sidebar: Encrypt data only — encrypt open/last draft via drafts.update (no send).
+ * Shows success or error message only.
+ */
+function onSidebarEncryptOnly_(e) {
+  const status = getEncryptOnlyStatus_({ gmail: {}, draftMetadata: {} });
+  try {
+    saveComposeSidebarStatus_(status.kind, status.message);
+  } catch (_saveErr) {}
+
+  return CardService.newActionResponseBuilder()
+    .setNotification(
+      CardService.newNotification().setText(
+        formatEncryptOnlyToast_(status.kind, status.message)
+      )
+    )
+    .setNavigation(
+      CardService.newNavigation().updateCard(
+        buildEncryptOnlyStatusCard_(status.kind, status.message)
+      )
+    )
+    .build();
+}
+
 /** Persist status then refresh sidebar — never return a standalone compose Card. */
 function buildComposeAppResultCard_(e, statusTitle, statusText) {
   var kind = /^error$/i.test(String(statusTitle || ""))
@@ -2196,14 +2555,14 @@ function buildComposeAppResultCard_(e, statusTitle, statusText) {
   return buildMainCard_(e);
 }
 
-/** @deprecated — composeTrigger removed; use sidebar Encrypt & send draft. */
+/** @deprecated — compose toolbar uses onGmailCompose (encrypt only). */
 function handleComposeToolbarClick_(e) {
-  return onSidebarEncryptAndSend_(e);
+  return onGmailCompose(e);
 }
 
 /** @deprecated */
 function buildComposeDirectCard_(e) {
-  return onSidebarEncryptAndSend_(e);
+  return onGmailCompose(e);
 }
 
 /** @deprecated — success/error now live on the sidebar via finishComposeInSidebar_. */
@@ -3516,20 +3875,31 @@ function loadDraftEncryptFiles_(messageId, payload, accessToken) {
   return files;
 }
 
-function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
+/**
+ * Find the open compose draft.
+ * @param {string[]} toEmails
+ * @param {string} subjectHint
+ * @param {string} accessToken
+ * @param {{ preferPlainBody?: boolean }} opts
+ *   preferPlainBody (Encrypt data only): prefer plaintext drafts so first click
+ *   does not match an older already-encrypted draft.
+ */
+function findMatchingGmailDraft_(toEmails, subjectHint, accessToken, opts) {
+  opts = opts || {};
+  const preferPlainBody = opts.preferPlainBody === true;
   const targets = [];
   for (let i = 0; i < (toEmails || []).length; i++) {
-    const e = normalizeEmailAddress_(toEmails[i]);
-    if (e && targets.indexOf(e) < 0) targets.push(e);
+    const email = normalizeEmailAddress_(toEmails[i]);
+    if (email && targets.indexOf(email) < 0) targets.push(email);
   }
-  const subjectWant = String(subjectHint || "").trim().toLowerCase();
+  const subjectWant = String(subjectHint || "")
+    .trim()
+    .toLowerCase();
 
-  // Gmail often has not autosaved yet; also after a successful send the draft
-  // is deleted so a second click sees an empty list.
   let drafts = [];
   let listError = "";
-  const attempts = 3;
-  for (let attempt = 0; attempt < attempts; attempt++) {
+  const listAttempts = 3;
+  for (let attempt = 0; attempt < listAttempts; attempt++) {
     if (attempt > 0) {
       Utilities.sleep(1000);
     }
@@ -3561,37 +3931,24 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
     };
   }
 
-  let best = null;
-  for (let i = 0; i < drafts.length; i++) {
-    const id = drafts[i] && drafts[i].id;
-    if (!id) continue;
-    const full = gmailApiRequest_(
-      "get",
-      "/gmail/v1/users/me/drafts/" + encodeURIComponent(id) + "?format=full",
-      null,
-      accessToken
-    );
-    if (!full.ok) continue;
-    const draftObj = full.data || {};
-    const msg = draftObj.message || {};
-    const payload = msg.payload || {};
-    const headers = payload.headers || [];
+  function scoreDraftCandidate_(draftObj, msg, payload, headers, body) {
     const toHdr = getMimeHeader_(headers, "To");
     const subj = getMimeHeader_(headers, "Subject");
     const draftTos = extractEmailsFromHeader_(toHdr);
     let score = 0;
 
     if (targets.length) {
-      if (!emailsOverlap_(targets, draftTos)) continue;
+      if (!emailsOverlap_(targets, draftTos)) return null;
       score += 10;
     } else if (draftTos.length) {
-      // Reply/forward: compose event often omits To — still match drafts that have recipients.
       score += 8;
     } else {
       score += 1;
     }
 
-    const subjNorm = String(subj || "").trim().toLowerCase();
+    const subjNorm = String(subj || "")
+      .trim()
+      .toLowerCase();
     if (subjectWant && subjNorm === subjectWant) {
       score += 5;
     } else if (
@@ -3603,15 +3960,16 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
       score += 2;
     }
 
-    // Prefer drafts that look like the open reply (have a body).
-    const body = extractMessagePlainBody_(payload);
     if (body && body.length > 0) score += 1;
-    if (/sds\./i.test(body) || /On .+wrote:/i.test(body)) score += 2;
 
-    const candidate = {
+    const isEncryptedBody = /sds\./i.test(body || "");
+    const internalDate = Number(msg.internalDate || 0);
+
+    return {
       ok: true,
-      draftId: draftObj.id || id,
+      draftId: draftObj.id || "",
       messageId: msg.id || "",
+      threadId: msg.threadId || "",
       toHeader: toHdr,
       toEmails: draftTos.length ? draftTos : targets,
       subject: subj || "",
@@ -3620,12 +3978,77 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
       bccHeader: getMimeHeader_(headers, "Bcc"),
       payload: payload,
       score: score,
+      internalDate: internalDate,
+      isEncryptedBody: isEncryptedBody,
     };
+  }
 
-    if (!best || candidate.score > best.score) {
-      best = candidate;
+  function compareDraftRank_(a, b) {
+    if (a.score !== b.score) return b.score - a.score;
+    return b.internalDate - a.internalDate;
+  }
+
+  function pickBestFromDraftList_(draftList) {
+    const candidates = [];
+    for (let i = 0; i < draftList.length; i++) {
+      const id = draftList[i] && draftList[i].id;
+      if (!id) continue;
+      const full = gmailApiRequest_(
+        "get",
+        "/gmail/v1/users/me/drafts/" + encodeURIComponent(id) + "?format=full",
+        null,
+        accessToken
+      );
+      if (!full.ok) continue;
+      const draftObj = full.data || {};
+      const msg = draftObj.message || {};
+      const payload = msg.payload || {};
+      const headers = payload.headers || [];
+      const body = extractMessagePlainBody_(payload);
+      const candidate = scoreDraftCandidate_(
+        draftObj,
+        msg,
+        payload,
+        headers,
+        body
+      );
+      if (!candidate) continue;
+      candidate.draftId = draftObj.id || id;
+      candidates.push(candidate);
     }
-    if (candidate.score >= 15) break;
+
+    if (!candidates.length) return null;
+
+    // Encrypt data only: if any plaintext draft matches, never pick encrypted.
+    if (preferPlainBody) {
+      const plainDrafts = candidates.filter(function (c) {
+        return !c.isEncryptedBody;
+      });
+      if (plainDrafts.length) {
+        plainDrafts.sort(compareDraftRank_);
+        return plainDrafts[0];
+      }
+    }
+
+    candidates.sort(compareDraftRank_);
+    return candidates[0];
+  }
+
+  let best = pickBestFromDraftList_(drafts);
+
+  if (preferPlainBody && best && best.isEncryptedBody) {
+    Utilities.sleep(2000);
+    const listAgain = gmailApiRequest_(
+      "get",
+      "/gmail/v1/users/me/drafts?maxResults=40",
+      null,
+      accessToken
+    );
+    if (listAgain.ok) {
+      const again = (listAgain.data && listAgain.data.drafts) || [];
+      const retryBest = pickBestFromDraftList_(again);
+      if (retryBest) best = retryBest;
+    }
   }
 
   if (!best) {
@@ -3773,6 +4196,93 @@ function gmailDraftCreate_(options, accessToken) {
     { message: { raw: raw } },
     accessToken
   );
+}
+
+/**
+ * Update an existing draft in place (Gmail drafts.update).
+ * Same draft id — used by Encrypt data only.
+ */
+function gmailDraftUpdate_(draftId, options, accessToken, draftMeta) {
+  if (!draftId) {
+    return { ok: false, error: "Draft id missing." };
+  }
+  draftMeta = draftMeta || {};
+  const rfc822 = buildRfc822EncryptedMime_(options);
+  const raw = encodeRawMime_(rfc822);
+  const message = { raw: raw };
+  if (draftMeta.messageId) message.id = String(draftMeta.messageId);
+  if (draftMeta.threadId) message.threadId = String(draftMeta.threadId);
+  return gmailApiRequest_(
+    "put",
+    "/gmail/v1/users/me/drafts/" + encodeURIComponent(draftId),
+    {
+      id: draftId,
+      message: message,
+    },
+    accessToken
+  );
+}
+
+/**
+ * Encrypt-only: prefer drafts.update on the open draft.
+ * Falls back to create + delete old only if update is not possible.
+ */
+function gmailReplaceDraftWithEncrypted_(oldDraftId, mimeOpts, accessToken, draftMeta) {
+  if (oldDraftId) {
+    const updated = gmailDraftUpdate_(
+      oldDraftId,
+      mimeOpts,
+      accessToken,
+      draftMeta || {}
+    );
+    if (updated.ok) {
+      return {
+        ok: true,
+        draftId: oldDraftId,
+        updated: true,
+        created: false,
+        oldDeleted: false,
+        error: "",
+      };
+    }
+  }
+
+  const created = gmailDraftCreate_(mimeOpts, accessToken);
+  if (!created.ok || !created.data) {
+    return {
+      ok: false,
+      draftId: "",
+      updated: false,
+      created: false,
+      oldDeleted: false,
+      error:
+        (oldDraftId ? "Could not update draft; create also failed. " : "") +
+        (created.error || "Could not create encrypted draft."),
+    };
+  }
+
+  const newDraftId = (created.data && created.data.id) || "";
+  let oldDeleted = false;
+  let deleteError = "";
+  if (oldDraftId && oldDraftId !== newDraftId) {
+    const del = gmailDraftDelete_(oldDraftId, accessToken);
+    if (del.ok) {
+      oldDeleted = true;
+    } else {
+      deleteError =
+        del.error ||
+        "Encrypted draft created, but the old plaintext draft could not be deleted.";
+    }
+  }
+
+  return {
+    ok: true,
+    draftId: newDraftId,
+    updated: false,
+    created: true,
+    oldDeleted: oldDeleted,
+    error: deleteError,
+  };
 }
 
 /** Send a draft (Gmail removes that draft after send). */
@@ -4334,48 +4844,11 @@ function doGet(e) {
       .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
   }
 
-  // Compose & send modal from Gmail card — compose-only (uses add-on session).
-  var view = String(params.view || "");
-  var embed = String(params.embed || "");
-  if (view === "compose" || view === "encrypt" || embed === "1") {
-    return serveComposeModal_(params);
-  }
-
   // Must use Template so <?!= include(...) ?> in Index.html are evaluated.
   return HtmlService.createTemplateFromFile("Index")
     .evaluate()
     .setTitle("SecureDocShare Workspace")
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
-}
-
-/** Overlay compose UI — no login shell; session from ticket or UserProperties. */
-function serveComposeModal_(params) {
-  var session = null;
-  var ticket = String((params && params.compose_ticket) || "").trim();
-
-  if (ticket) {
-    try {
-      var raw = CacheService.getScriptCache().get("sds_compose_" + ticket);
-      CacheService.getScriptCache().remove("sds_compose_" + ticket);
-      if (raw) session = JSON.parse(raw);
-    } catch (eCache) {
-      session = null;
-    }
-  }
-  if (!session || !session.token) {
-    session = getWorkspaceSession_();
-  }
-
-  var template = HtmlService.createTemplateFromFile("Compose");
-  template.sessionJson = JSON.stringify(session || null);
-  var page = template
-    .evaluate()
-    .setTitle("SecureDocShare — Compose")
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
-  try {
-    page.setWidth(420).setHeight(640);
-  } catch (eSize) {}
-  return page;
 }
 
 function serveCachedDownload_(key) {

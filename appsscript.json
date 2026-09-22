@@ -68,7 +68,7 @@
       "composeTrigger": {
         "selectActions": [
           {
-            "text": "SecureDocShare Encrypt & Send",
+            "text": "SecureDocShare Encrypt data only",
             "runFunction": "onGmailCompose"
           }
         ],

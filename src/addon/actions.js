@@ -366,28 +366,31 @@ function getComposeDraftMeta_(e) {
   };
 }
 
-function resolveComposeEncryptPayload_(e, gmailAccessToken) {
-  var draftMeta = getComposeDraftMeta_(e);
-  var toList = (draftMeta.to && draftMeta.to.length) ? draftMeta.to.slice() : [];
+function resolveComposeEncryptPayload_(e, gmailAccessToken, opts) {
+  opts = opts || {};
+  const draftMeta = getComposeDraftMeta_(e);
+  const toList =
+    draftMeta.to && draftMeta.to.length ? draftMeta.to.slice() : [];
 
-  var matched = findMatchingGmailDraft_(
+  const matched = findMatchingGmailDraft_(
     toList,
     draftMeta.subject || "",
-    gmailAccessToken
+    gmailAccessToken,
+    { preferPlainBody: opts.preferPlainBody === true }
   );
 
-  var firstTo = "";
+  let firstTo = "";
   if (toList.length) {
     firstTo = normalizeEmailAddress_(toList[0]) || String(toList[0]).trim();
   } else if (matched.ok && matched.toEmails && matched.toEmails.length) {
     firstTo = matched.toEmails[0];
   }
 
-  var subject =
+  const subject =
     (matched.ok && matched.subject) || draftMeta.subject || "";
-  var message = (matched.ok && matched.body) || "";
+  const message = (matched.ok && matched.body) || "";
 
-  var toJoined =
+  const toJoined =
     toList.join(", ") ||
     (matched.ok && matched.toHeader) ||
     firstTo;
@@ -483,7 +486,7 @@ function runComposeEncryptAndSendCore_(e) {
   }
 
   try {
-    var result = runComposeEncryptAndSendCoreUnlocked_(e);
+    var result = runComposeEncryptAndSendCoreUnlocked_(e, { encryptOnly: false });
     if (!result.ok && isMissingDraftError_(result)) {
       var recent = getRecentComposeSendSuccess_(
         result.firstTo || earlyTo,
@@ -513,7 +516,30 @@ function runComposeEncryptAndSendCore_(e) {
   }
 }
 
-function runComposeEncryptAndSendCoreUnlocked_(e) {
+/** Encrypt draft body and update via Gmail drafts.update — does not send. */
+function runComposeEncryptOnlyCore_(e) {
+  var lock = LockService.getUserLock();
+  var gotLock = false;
+  try {
+    gotLock = lock.tryLock(45000);
+  } catch (eLock) {
+    gotLock = false;
+  }
+  try {
+    return runComposeEncryptAndSendCoreUnlocked_(e, { encryptOnly: true });
+  } finally {
+    if (gotLock) {
+      try {
+        lock.releaseLock();
+      } catch (eRel) {}
+    }
+  }
+}
+
+function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
+  opts = opts || {};
+  var encryptOnly = opts.encryptOnly === true;
+
   var gate = verifyLoginAndSubscription_();
   if (!gate.ok) {
     return {
@@ -535,8 +561,10 @@ function runComposeEncryptAndSendCoreUnlocked_(e) {
     };
   }
 
-  var accessToken = tokenRes.accessToken;
-  var payload = resolveComposeEncryptPayload_(e, accessToken);
+  const accessToken = tokenRes.accessToken;
+  const payload = resolveComposeEncryptPayload_(e, accessToken, {
+    preferPlainBody: encryptOnly,
+  });
   if (
     payload.matched &&
     payload.matched.ok === false &&
@@ -596,91 +624,120 @@ function runComposeEncryptAndSendCoreUnlocked_(e) {
     };
   }
 
-  // Reply/forward handling:
+  // Reply/forward handling (Encrypt & send only):
   // - Decrypt any parent sds. with the signed-in user's keys
   // - Strip old sdmeta (avoid duplicate / glued "testsdmeta")
   // - Pure forward / empty new body: re-encrypt decrypted plain for the NEW To
   // - Reply with new text: encrypt only the new text; append clear parent (no old meta)
-  var split = splitComposeNewAndQuoted_(payload.message || "");
-  var newMessage = String(split.newText || "").trim();
-  var quotedBlock = String(split.quotedBlock || "").trim();
-  var sessionEmail =
-    (gate.email && String(gate.email)) ||
-    (getWorkspaceSession_() && getWorkspaceSession_().email) ||
-    "";
-  var subject = payload.subject || "Secure document";
-  var isForwardSubject = /^(fw|fwd)\s*:/i.test(String(subject).trim());
-  var quotedClear = "";
-  var quotedAppendix = "";
+  // Encrypt data only: never decrypt — encrypt plain body/file only.
+  let messageToEncrypt = "";
+  let quotedAppendix = "";
+  const subject = payload.subject || "Secure document";
 
-  // Body is only ciphertext (common on Forward with no markers).
-  if (!quotedBlock && /sds\./i.test(newMessage)) {
-    quotedBlock = newMessage;
-    newMessage = "";
-  }
-
-  if (quotedBlock) {
-    var quoteDec = decryptQuotedParentSds_(
-      quotedBlock,
-      gate.token,
-      sessionEmail
-    );
-    if (!quoteDec.ok) {
+  if (encryptOnly) {
+    let plainBody = String(payload.message || "").trim();
+    if (/sds\./i.test(plainBody)) {
+      const splitBody = splitComposeNewAndQuoted_(plainBody);
+      const newPlainText = String(splitBody.newText || "").trim();
+      if (newPlainText && !/sds\./i.test(newPlainText)) {
+        plainBody = newPlainText;
+      } else {
+        return {
+          ok: false,
+          error: ENCRYPT_ONLY_MESSAGES.ALREADY_ENCRYPTED,
+          code: "ALREADY_ENCRYPTED",
+        };
+      }
+    }
+    messageToEncrypt = plainBody;
+    if (!String(messageToEncrypt || "").trim() && !fileToEncrypt) {
       return {
         ok: false,
-        error:
-          quoteDec.error ||
-          "Could not decrypt the quoted parent message. Open the original mail, decrypt once, then try again.",
+        error: ENCRYPT_ONLY_MESSAGES.NOTHING_TO_ENCRYPT,
       };
     }
-    quotedClear = stripSecureDocMetadataBlock_(
-      String(quoteDec.text || "").trim()
-    );
-  }
+  } else {
+    var split = splitComposeNewAndQuoted_(payload.message || "");
+    var newMessage = String(split.newText || "").trim();
+    var quotedBlock = String(split.quotedBlock || "").trim();
+    var sessionEmail =
+      (gate.email && String(gate.email)) ||
+      (getWorkspaceSession_() && getWorkspaceSession_().email) ||
+      "";
+    var isForwardSubject = /^(fw|fwd)\s*:/i.test(String(subject).trim());
+    var quotedClear = "";
 
-  if (newMessage && /sds\./i.test(newMessage)) {
-    var newDec = decryptQuotedParentSds_(
-      newMessage,
-      gate.token,
-      sessionEmail
-    );
-    if (!newDec.ok) {
-      return {
-        ok: false,
-        error:
-          newDec.error ||
-          "Could not decrypt the message body before encrypting for the new recipient.",
-      };
+    // Body is only ciphertext (common on Forward with no markers).
+    if (!quotedBlock && /sds\./i.test(newMessage)) {
+      quotedBlock = newMessage;
+      newMessage = "";
     }
-    newMessage = stripSecureDocMetadataBlock_(String(newDec.text || "").trim());
-  }
 
-  var messageToEncrypt = newMessage;
-  if (!messageToEncrypt) {
-    // Pure forward / empty reply: re-encrypt parent plain for the NEW recipient.
-    messageToEncrypt = extractForwardPlainMessage_(quotedClear);
-    quotedAppendix = "";
-  } else if (quotedClear) {
-    // Reply with new text: keep parent readable, without old metadata.
-    quotedAppendix = isForwardSubject
-      ? ""
-      : extractForwardPlainMessage_(quotedClear);
-    if (isForwardSubject) {
-      // Forward + typed note: encrypt note + parent plain together for new To.
-      var parentPlain = extractForwardPlainMessage_(quotedClear);
-      messageToEncrypt = parentPlain
-        ? messageToEncrypt + "\n\n" + parentPlain
-        : messageToEncrypt;
+    if (quotedBlock) {
+      var quoteDec = decryptQuotedParentSds_(
+        quotedBlock,
+        gate.token,
+        sessionEmail
+      );
+      if (!quoteDec.ok) {
+        return {
+          ok: false,
+          error:
+            quoteDec.error ||
+            "Could not decrypt the quoted parent message. Open the original mail, decrypt once, then try again.",
+        };
+      }
+      quotedClear = stripSecureDocMetadataBlock_(
+        String(quoteDec.text || "").trim()
+      );
+    }
+
+    if (newMessage && /sds\./i.test(newMessage)) {
+      var newDec = decryptQuotedParentSds_(
+        newMessage,
+        gate.token,
+        sessionEmail
+      );
+      if (!newDec.ok) {
+        return {
+          ok: false,
+          error:
+            newDec.error ||
+            "Could not decrypt the message body before encrypting for the new recipient.",
+        };
+      }
+      newMessage = stripSecureDocMetadataBlock_(
+        String(newDec.text || "").trim()
+      );
+    }
+
+    messageToEncrypt = newMessage;
+    if (!messageToEncrypt) {
+      // Pure forward / empty reply: re-encrypt parent plain for the NEW recipient.
+      messageToEncrypt = extractForwardPlainMessage_(quotedClear);
       quotedAppendix = "";
+    } else if (quotedClear) {
+      // Reply with new text: keep parent readable, without old metadata.
+      quotedAppendix = isForwardSubject
+        ? ""
+        : extractForwardPlainMessage_(quotedClear);
+      if (isForwardSubject) {
+        // Forward + typed note: encrypt note + parent plain together for new To.
+        var parentPlain = extractForwardPlainMessage_(quotedClear);
+        messageToEncrypt = parentPlain
+          ? messageToEncrypt + "\n\n" + parentPlain
+          : messageToEncrypt;
+        quotedAppendix = "";
+      }
     }
-  }
 
-  if (!String(messageToEncrypt || "").trim() && !fileToEncrypt) {
-    return {
-      ok: false,
-      error:
-        "Nothing to encrypt. Add a message or file, or forward an encrypted mail you can decrypt.",
-    };
+    if (!String(messageToEncrypt || "").trim() && !fileToEncrypt) {
+      return {
+        ok: false,
+        error:
+          "Nothing to encrypt. Add a message or file, or forward an encrypted mail you can decrypt.",
+      };
+    }
   }
 
   var fileOpts = null;
@@ -763,7 +820,7 @@ function runComposeEncryptAndSendCoreUnlocked_(e) {
   if (!cipher && !encAttB64) {
     return {
       ok: false,
-      error: "Encrypt returned no message and no file. Nothing was sent.",
+      error: "Encrypt returned no message and no file. Nothing was saved.",
     };
   }
 
@@ -784,6 +841,55 @@ function runComposeEncryptAndSendCoreUnlocked_(e) {
     attachmentName: encAttB64 ? encAttName : "",
     attachmentBase64: encAttB64 || "",
   };
+
+  // Encrypt data only: update open draft (no send).
+  if (encryptOnly) {
+    if (!oldDraftId) {
+      return {
+        ok: false,
+        error:
+          "No open draft found. Keep compose open, wait for autosave, then try again.",
+        code: "NO_DRAFT_MATCH",
+      };
+    }
+    var draftMeta = {
+      messageId:
+        payload.matched && payload.matched.ok
+          ? payload.matched.messageId || ""
+          : "",
+      threadId:
+        payload.matched && payload.matched.ok
+          ? payload.matched.threadId || ""
+          : "",
+    };
+    var replaced = gmailReplaceDraftWithEncrypted_(
+      oldDraftId,
+      mimeOpts,
+      accessToken,
+      draftMeta
+    );
+    if (!replaced.ok) {
+      return {
+        ok: false,
+        error: replaced.error || "Could not update draft with encrypted body.",
+      };
+    }
+    return {
+      ok: true,
+      sent: false,
+      encryptedOnly: true,
+      draftUpdated: Boolean(replaced.updated),
+      draftCreated: Boolean(replaced.created),
+      oldDraftDeleted: Boolean(replaced.oldDeleted),
+      warning: replaced.error || "",
+      firstTo: payload.firstTo,
+      subject: subject,
+      bodyHtml: bodyHtml,
+      bodyText: bodyText,
+      cipher: cipher,
+      draftId: replaced.draftId || oldDraftId,
+    };
+  }
 
   // 1) Create encrypted draft → 2) send → 3) delete plaintext draft
   var flow = gmailCreateEncryptedDraftSendAndCleanup_(
@@ -905,7 +1011,7 @@ function clearComposeSidebarStatus_() {
 function finishComposeInSidebar_(e, kind, message) {
   saveComposeSidebarStatus_(kind, message);
   var toast = String(message || "").replace(/\n/g, " ").slice(0, 220);
-  if (kind === "success") toast = "✔ " + toast;
+  if (kind === "success" || kind === "encrypted") toast = "✔ " + toast;
   else if (kind === "error") toast = "✖ " + toast;
   else if (kind === "need_gmail") toast = "Connect Gmail to continue.";
 
@@ -1022,6 +1128,117 @@ function onSidebarEncryptAndSend_(e) {
   return finishComposeSendAndCloseCompose_(e, okMsg);
 }
 
+/**
+ * Build Encrypt data only status: { kind, message }.
+ * @param {Object} event — compose event (draft METADATA) or empty for sidebar.
+ */
+function getEncryptOnlyStatus_(event) {
+  const auth = getValidWorkspaceAuth_();
+  if (!auth) {
+    return {
+      kind: "error",
+      message: ENCRYPT_ONLY_MESSAGES.SIGN_IN,
+    };
+  }
+
+  let encryptResult;
+  try {
+    encryptResult = runComposeEncryptOnlyCore_(event || {});
+  } catch (err) {
+    return {
+      kind: "error",
+      message:
+        ENCRYPT_ONLY_MESSAGES.UNEXPECTED +
+        " " +
+        String(err && err.message ? err.message : err),
+    };
+  }
+
+  if (encryptResult.needLogin) {
+    return {
+      kind: "error",
+      message: encryptResult.error || ENCRYPT_ONLY_MESSAGES.LOGIN_REQUIRED,
+    };
+  }
+
+  if (
+    encryptResult.needGmailConnect ||
+    encryptResult.code === "GMAIL_NOT_CONNECTED" ||
+    /Connect Gmail|Gmail not connected|GMAIL_NOT_CONNECTED/i.test(
+      String(encryptResult.error || "")
+    )
+  ) {
+    return {
+      kind: "need_gmail",
+      message: encryptResult.error || ENCRYPT_ONLY_MESSAGES.GMAIL_CONNECT,
+    };
+  }
+
+  if (!encryptResult.ok || !encryptResult.encryptedOnly) {
+    let errorMessage = String(
+      encryptResult.error || ENCRYPT_ONLY_MESSAGES.FAILED
+    );
+    if (/DECRYPT|decrypt|recipient UUID/i.test(errorMessage)) {
+      errorMessage = ENCRYPT_ONLY_MESSAGES.ALREADY_ENCRYPTED;
+    }
+    return {
+      kind: "error",
+      message: errorMessage,
+    };
+  }
+
+  let successMessage = ENCRYPT_ONLY_MESSAGES.SUCCESS;
+  if (encryptResult.warning) {
+    successMessage += "\n" + String(encryptResult.warning);
+  }
+  return { kind: "encrypted", message: successMessage };
+}
+
+/** @deprecated Use getEncryptOnlyStatus_ */
+function runEncryptOnlyOutcome_(e) {
+  return getEncryptOnlyStatus_(e);
+}
+
+function formatEncryptOnlyToast_(kind, message) {
+  const toastText = String(message || "")
+    .replace(/\n/g, " ")
+    .slice(0, 220);
+  if (kind === "encrypted" || kind === "success") {
+    return "✔ " + toastText;
+  }
+  if (kind === "error") {
+    return "✖ " + toastText;
+  }
+  if (kind === "need_gmail") {
+    return ENCRYPT_ONLY_MESSAGES.GMAIL_CONNECT;
+  }
+  return toastText;
+}
+
+/**
+ * Sidebar: Encrypt data only — encrypt open/last draft via drafts.update (no send).
+ * Shows success or error message only.
+ */
+function onSidebarEncryptOnly_(e) {
+  const status = getEncryptOnlyStatus_({ gmail: {}, draftMetadata: {} });
+  try {
+    saveComposeSidebarStatus_(status.kind, status.message);
+  } catch (_saveErr) {}
+
+  return CardService.newActionResponseBuilder()
+    .setNotification(
+      CardService.newNotification().setText(
+        formatEncryptOnlyToast_(status.kind, status.message)
+      )
+    )
+    .setNavigation(
+      CardService.newNavigation().updateCard(
+        buildEncryptOnlyStatusCard_(status.kind, status.message)
+      )
+    )
+    .build();
+}
+
 /** Persist status then refresh sidebar — never return a standalone compose Card. */
 function buildComposeAppResultCard_(e, statusTitle, statusText) {
   var kind = /^error$/i.test(String(statusTitle || ""))
@@ -1033,14 +1250,14 @@ function buildComposeAppResultCard_(e, statusTitle, statusText) {
   return buildMainCard_(e);
 }
 
-/** @deprecated — composeTrigger removed; use sidebar Encrypt & send draft. */
+/** @deprecated — compose toolbar uses onGmailCompose (encrypt only). */
 function handleComposeToolbarClick_(e) {
-  return onSidebarEncryptAndSend_(e);
+  return onGmailCompose(e);
 }
 
 /** @deprecated */
 function buildComposeDirectCard_(e) {
-  return onSidebarEncryptAndSend_(e);
+  return onGmailCompose(e);
 }
 
 /** @deprecated — success/error now live on the sidebar via finishComposeInSidebar_. */

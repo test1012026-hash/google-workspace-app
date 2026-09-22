@@ -49,6 +49,45 @@ function buildGmailMessageCard_(e) {
   return buildMainCard_(e);
 }
 
+/**
+ * Encrypt data only result card — success or error message only.
+ * @param {string} kind
+ * @param {string} message
+ */
+function buildEncryptOnlyStatusCard_(kind, message) {
+  const statusKind = String(kind || "error");
+  const isSuccess = statusKind === "encrypted" || statusKind === "success";
+  const needsGmail = statusKind === "need_gmail";
+  const subtitle = isSuccess
+    ? "Encrypted"
+    : needsGmail
+      ? "Connect Gmail"
+      : "Error";
+  const fallbackMessage =
+    typeof ENCRYPT_ONLY_MESSAGES !== "undefined"
+      ? ENCRYPT_ONLY_MESSAGES.FAILED
+      : "Could not encrypt the draft.";
+
+  return CardService.newCardBuilder()
+    .setHeader(cardHeader_("SecureDocShare", subtitle))
+    .addSection(
+      CardService.newCardSection().addWidget(
+        CardService.newTextParagraph().setText(
+          coloredStatusParagraphText_(
+            statusKind,
+            message || fallbackMessage
+          )
+        )
+      )
+    )
+    .build();
+}
+
+/** @deprecated Use buildEncryptOnlyStatusCard_ */
+function buildEncryptOnlyResultCard_(kind, message) {
+  return buildEncryptOnlyStatusCard_(kind, message);
+}
+
 /** Side panel: login screen OR tools (never tools without auth). */
 function buildMainCard_(e) {
   var valid = getValidWorkspaceAuth_();
@@ -66,7 +105,8 @@ function buildMainCard_(e) {
       ? peekComposeSidebarStatus_()
       : null;
   var subtitle = "Ready";
-  if (status && status.kind === "success") subtitle = "Sent";
+  if (status && status.kind === "encrypted") subtitle = "Encrypted";
+  else if (status && status.kind === "success") subtitle = "Sent";
   else if (status && status.kind === "error") subtitle = "Error";
   else if (status && status.kind === "working") subtitle = "Working…";
   else if (status && status.kind === "need_gmail") subtitle = "Connect Gmail";
@@ -76,21 +116,11 @@ function buildMainCard_(e) {
   );
 
   if (status && status.message) {
-    var statusHeader =
-      status.kind === "success"
-        ? "✔ SUCCESS"
-        : status.kind === "error"
-          ? "✖ ERROR"
-          : status.kind === "need_gmail"
-            ? "Connect Gmail"
-            : status.kind === "working"
-              ? "Working…"
-              : "Status";
-    var statusSection = CardService.newCardSection()
-      .setHeader(statusHeader)
-      .addWidget(
-        CardService.newTextParagraph().setText(String(status.message))
-      );
+    var statusSection = CardService.newCardSection().addWidget(
+      CardService.newTextParagraph().setText(
+        coloredStatusParagraphText_(status.kind, status.message)
+      )
+    );
 
     if (status.kind === "need_gmail") {
       var session = valid.session || {};
@@ -295,8 +325,17 @@ function buildSignedInSection_(session, prefetchedAuth) {
         )
     )
     .addWidget(
+      CardService.newButtonSet().addButton(
+        CardService.newTextButton()
+          .setText("Encrypt data only")
+          .setOnClickAction(
+            CardService.newAction().setFunctionName("onSidebarEncryptOnly_")
+          )
+      )
+    )
+    .addWidget(
       CardService.newTextParagraph().setText(
-        "Uses your open Gmail draft. Progress and result stay in this sidebar."
+        "Encrypt data only updates your open draft (no send). Encrypt & send encrypts and sends."
       )
     )
     .addWidget(

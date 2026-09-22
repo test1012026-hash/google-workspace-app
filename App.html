@@ -31,7 +31,6 @@ var _uiMode = "encrypt";
 var _sessionEmail = "";
 var _subscriptionActive = false;
 var _sessionToken = "";
-var _recipientInput = null;
 var SIGNUP_DRAFT_KEY = "sds_workspace_signup_draft";
 
 function saveSignupDraft_(email, password, acceptTerms) {
@@ -99,10 +98,6 @@ function readSignupFormOrDraft_() {
 }
 
 document.addEventListener("DOMContentLoaded", function () {
-  if (window.__COMPOSE_MODAL__) {
-    bootComposeModal_();
-    return;
-  }
   initAuthUi();
   var bootDraft = loadSignupDraft_();
   if (bootDraft && bootDraft.otpSent) {
@@ -111,7 +106,6 @@ document.addEventListener("DOMContentLoaded", function () {
     setAuthMode("login");
   }
   bindModeTabs();
-  initRecipientChips_();
   bindEncryptUi();
   bindDecryptUi();
   applyViewQuery_();
@@ -120,141 +114,23 @@ document.addEventListener("DOMContentLoaded", function () {
   refreshAuthState(function () {});
 });
 
-/**
- * Card compose overlay: recipient chips + subject + message using add-on session.
- */
-function bootComposeModal_() {
-  try {
-    document.documentElement.classList.add("is-embed", "is-compose-modal");
-    document.body.classList.add("is-embed", "is-compose-modal");
-  } catch (e0) {}
-
-  _uiMode = "encrypt";
-  initRecipientChips_();
-  bindEncryptUi();
-
-  var gate = document.getElementById("compose-gate");
-  var root = document.getElementById("compose-modal-root");
-  var gateMsg = document.getElementById("compose-gate-msg");
-  var userLabel = document.getElementById("compose-user-label");
-
-  function showGate(msg) {
-    if (gateMsg && msg) gateMsg.textContent = msg;
-    if (gate) gate.style.display = "block";
-    if (root) root.style.display = "none";
-  }
-
-  function showCompose(email) {
-    if (gate) gate.style.display = "none";
-    if (root) root.style.display = "flex";
-    if (userLabel) {
-      userLabel.textContent = email
-        ? "Signed in as " + email
-        : "SecureDoc compose";
-    }
-  }
-
-  function applySession(session) {
-    if (!session || !session.token) {
-      showGate(
-        "Sign in from the SecureDocShare side panel first, then open Compose again."
-      );
-      return;
-    }
-    try {
-      if (typeof saveSession === "function") {
-        saveSession({
-          token: session.token,
-          email: session.email || "",
-          expiresAt: session.expiresAt || null,
-        });
-      }
-    } catch (e1) {}
-    _sessionToken = String(session.token);
-    _sessionEmail = String(session.email || "");
-    _authReady = true;
-
-    requireAuthAndSubscription(function (ok, errMsg) {
-      if (!ok) {
-        showGate(
-          errMsg ||
-            "Sign in with an active subscription from the SecureDocShare side panel."
-        );
-        return;
-      }
-      showCompose(_sessionEmail);
-    });
-  }
-
-  var injected = null;
-  try {
-    injected = window.__WORKSPACE_SESSION__ || null;
-  } catch (e2) {
-    injected = null;
-  }
-
-  if (injected && injected.token) {
-    applySession(injected);
-    return;
-  }
-
-  hydrateSessionFromAppsScript_(function (session) {
-    if (session && session.token) {
-      applySession(session);
-      return;
-    }
-    var local =
-      typeof getStoredSession === "function" ? getStoredSession() : null;
-    if (local && local.token) {
-      applySession(local);
-      return;
-    }
-    showGate(
-      "Sign in from the SecureDocShare side panel first, then open Compose again."
-    );
-  });
-}
-
-/** Card "Compose & send" → ?view=compose&embed=1 (Gmail overlay). */
+/** Optional ?view=encrypt|decrypt for Index web panel. */
 function applyViewQuery_() {
   try {
     var params = new URLSearchParams(location.search || "");
     var view = params.get("view");
-    var embed = params.get("embed") === "1";
-    if (view === "compose" || view === "encrypt") {
+    if (view === "encrypt") {
       _uiMode = "encrypt";
     } else if (view === "decrypt") {
       _uiMode = "decrypt";
     }
-    if (embed) {
+    if (params.get("embed") === "1") {
       try {
         document.documentElement.classList.add("is-embed");
         document.body.classList.add("is-embed");
       } catch (e0) {}
     }
   } catch (e) {}
-}
-
-function initComposeWidgets_() {
-  initRecipientChips_();
-}
-
-/** Recipient chips + Google Contacts dropdown (People API via Apps Script). */
-function initRecipientChips_() {
-  var recipientRoot = document.getElementById("recipient-input-root");
-  if (!recipientRoot || typeof createRecipientInput !== "function") {
-    var fallback = document.getElementById("encrypt-to");
-    if (fallback) fallback.style.display = "";
-    return;
-  }
-  if (_recipientInput) return;
-  _recipientInput = createRecipientInput(recipientRoot, {
-    placeholder: "Type name or email…",
-    onChange: function (emails) {
-      var hidden = document.getElementById("encrypt-to");
-      if (hidden) hidden.value = (emails || []).join(", ");
-    },
-  });
 }
 
 /**
@@ -1125,9 +1001,6 @@ function setEncryptButtonsDisabled(disabled) {
   var btnSend = document.getElementById("btn-encrypt-send");
   if (btn) btn.disabled = Boolean(disabled);
   if (btnSend) btnSend.disabled = Boolean(disabled);
-  if (_recipientInput && typeof _recipientInput.setDisabled === "function") {
-    _recipientInput.setDisabled(disabled);
-  }
   var toEl = document.getElementById("encrypt-to");
   if (toEl) toEl.disabled = Boolean(disabled);
   var subEl = document.getElementById("encrypt-subject");
@@ -1142,18 +1015,13 @@ function collectEncryptForm() {
   var subEl = document.getElementById("encrypt-subject");
   var msgEl = document.getElementById("encrypt-message");
   var fileEl = document.getElementById("encrypt-file");
-  var recipients = [];
-  if (_recipientInput && typeof _recipientInput.getEmails === "function") {
-    recipients = _recipientInput.getEmails();
-  } else {
-    var toEl = document.getElementById("encrypt-to");
-    var single = toEl ? String(toEl.value || "").trim() : "";
-    if (single) {
-      recipients = single.split(/[,;\s]+/).map(function (s) {
+  var toEl = document.getElementById("encrypt-to");
+  var single = toEl ? String(toEl.value || "").trim() : "";
+  var recipients = single
+    ? single.split(/[,;\s]+/).map(function (s) {
         return String(s || "").trim();
-      }).filter(Boolean);
-    }
-  }
+      }).filter(Boolean)
+    : [];
   return {
     recipients: recipients,
     subject: subEl ? String(subEl.value || "").trim() : "",
@@ -1163,9 +1031,6 @@ function collectEncryptForm() {
 }
 
 function clearEncryptForm_() {
-  if (_recipientInput && typeof _recipientInput.clear === "function") {
-    _recipientInput.clear();
-  }
   var toEl = document.getElementById("encrypt-to");
   if (toEl) toEl.value = "";
   var subEl = document.getElementById("encrypt-subject");

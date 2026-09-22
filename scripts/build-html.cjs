@@ -42,7 +42,6 @@ function bundleCommonJs() {
 wrapCss("Stylesheet", "styles.css");
 wrapJs("Config", readWeb("config.js"));
 wrapJs("Common", bundleCommonJs());
-wrapJs("ComposeUi", readWeb("compose-ui.js"));
 wrapJs("GmailSend", readWeb("gmail-send.js"));
 wrapJs("App", readWeb("app.js"));
 
@@ -55,24 +54,12 @@ html = html.replace(
   "<?!= include('Stylesheet'); ?>"
 );
 html = html.replace(
-  /<script\s+src="config\.js"><\/script>\s*<script\s+src="common\.js"><\/script>\s*<script\s+src="compose-ui\.js"><\/script>\s*<script\s+src="gmail-send\.js"><\/script>\s*<script\s+src="app\.js"><\/script>/i,
-  "<?!= include('Config'); ?>\n    <?!= include('Common'); ?>\n    <?!= include('ComposeUi'); ?>\n    <?!= include('GmailSend'); ?>\n    <?!= include('App'); ?>"
+  /<script\s+src="config\.js"><\/script>\s*<script\s+src="common\.js"><\/script>\s*(?:<script\s+src="compose-ui\.js"><\/script>\s*)?<script\s+src="gmail-send\.js"><\/script>\s*<script\s+src="app\.js"><\/script>/i,
+  "<?!= include('Config'); ?>\n    <?!= include('Common'); ?>\n    <?!= include('GmailSend'); ?>\n    <?!= include('App'); ?>"
 );
-if (html.indexOf("include('ComposeUi')") < 0) {
-  html = html.replace(
-    /<script\s+src="config\.js"><\/script>\s*<script\s+src="common\.js"><\/script>\s*<script\s+src="gmail-send\.js"><\/script>\s*<script\s+src="app\.js"><\/script>/i,
-    "<?!= include('Config'); ?>\n    <?!= include('Common'); ?>\n    <?!= include('ComposeUi'); ?>\n    <?!= include('GmailSend'); ?>\n    <?!= include('App'); ?>"
-  );
-}
 if (html.indexOf('<base target="_top">') < 0) {
   html = html.replace("<head>", '<head>\n    <base target="_top">');
 }
 
 fs.writeFileSync(path.join(root, "Index.html"), html);
 console.log("Wrote Index.html");
-
-const composeSrc = path.join(web, "compose.html");
-if (fs.existsSync(composeSrc)) {
-  fs.copyFileSync(composeSrc, path.join(root, "Compose.html"));
-  console.log("Wrote Compose.html");
-}
