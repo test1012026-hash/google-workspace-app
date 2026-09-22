@@ -37,8 +37,12 @@ function onGmailMessage(e) {
   return buildGmailMessageCard_(e);
 }
 
+/**
+ * Not registered (composeTrigger removed). Gmail always opens a card modal for
+ * compose selectActions — Encrypt & send lives on the sidebar button instead.
+ */
 function onGmailCompose(e) {
-  return buildComposeDirectCard_(e);
+  return onSidebarEncryptAndSend_(e);
 }
 
 /**
@@ -265,6 +269,9 @@ function authCallback(request) {
         "<script>window.top.location.replace(" +
         JSON.stringify(appUrl) +
         ");</script>" +
+        "<p><a style='color:#2bb3a0' href='" +
+        escapeHtml_(appUrl) +
+        "'>Continue</a></p>" +
         "</body></html>"
     ).setTitle("Signed in");
   }
@@ -401,9 +408,71 @@ function buildMainCard_(e) {
       .build();
   }
 
+  var status =
+    typeof peekComposeSidebarStatus_ === "function"
+      ? peekComposeSidebarStatus_()
+      : null;
+  var subtitle = "Ready";
+  if (status && status.kind === "success") subtitle = "Sent";
+  else if (status && status.kind === "error") subtitle = "Error";
+  else if (status && status.kind === "working") subtitle = "Working…";
+  else if (status && status.kind === "need_gmail") subtitle = "Connect Gmail";
+
   var card = CardService.newCardBuilder().setHeader(
-    cardHeader_("SecureDocShare", "Ready")
+    cardHeader_("SecureDocShare", subtitle)
   );
+
+  if (status && status.message) {
+    var statusHeader =
+      status.kind === "success"
+        ? "✔ SUCCESS"
+        : status.kind === "error"
+          ? "✖ ERROR"
+          : status.kind === "need_gmail"
+            ? "Connect Gmail"
+            : status.kind === "working"
+              ? "Working…"
+              : "Status";
+    var statusSection = CardService.newCardSection()
+      .setHeader(statusHeader)
+      .addWidget(
+        CardService.newTextParagraph().setText(String(status.message))
+      );
+
+    if (status.kind === "need_gmail") {
+      var session = valid.session || {};
+      var connect = session.token
+        ? apiGmailConnectUrl_(session.token)
+        : { ok: false };
+      if (connect.ok && connect.url) {
+        statusSection.addWidget(
+          CardService.newButtonSet().addButton(
+            CardService.newTextButton()
+              .setText("Connect Gmail")
+              .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+              .setOpenLink(
+                CardService.newOpenLink()
+                  .setUrl(connect.url)
+                  .setOpenAs(CardService.OpenAs.FULL_SIZE)
+                  .setOnClose(CardService.OnClose.RELOAD)
+              )
+          )
+        );
+      }
+    }
+
+    statusSection.addWidget(
+      CardService.newButtonSet().addButton(
+        CardService.newTextButton()
+          .setText("Dismiss")
+          .setOnClickAction(
+            CardService.newAction().setFunctionName("onDismissComposeStatus_")
+          )
+      )
+    );
+    card.addSection(statusSection);
+  }
+
   card.addSection(buildSignedInSection_(valid.session, valid.auth));
   card.addSection(buildDecryptSection_(e));
   card.addSection(buildLinksSection_());
@@ -456,6 +525,7 @@ function buildLoginSection_(e) {
   var emailInput = CardService.newTextInput()
     .setFieldName("login_email")
     .setTitle("Email")
+    .setHint("you@company.com");
   if (isSignup && draftEmail) emailInput.setValue(draftEmail);
 
   var passwordInput = CardService.newTextInput()
@@ -559,6 +629,22 @@ function buildSignedInSection_(session, prefetchedAuth) {
               : "https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/person/default/24px.svg"
           )
         )
+    )
+    .addWidget(
+      CardService.newButtonSet()
+        .addButton(
+          CardService.newTextButton()
+            .setText("Encrypt & send draft")
+            .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+            .setOnClickAction(
+              CardService.newAction().setFunctionName("onSidebarEncryptAndSend_")
+            )
+        )
+    )
+    .addWidget(
+      CardService.newTextParagraph().setText(
+        "Uses your open Gmail draft. Progress and result stay in this sidebar."
+      )
     )
     .addWidget(
       CardService.newButtonSet()
@@ -852,13 +938,13 @@ function buildAutoDecryptCard_(e, session, scan) {
       .setHeader(cardHeader_("SecureDocShare", "Decrypt failed"))
       .addSection(statusSection)
       .addSection(buildSignedInSection_(session, auth))
-      // .addSection(
-      //   CardService.newCardSection().addWidget(
-      //     CardService.newButtonSet()
-      //       .addButton(secondaryBtn_("Refresh", "onRefreshAutoDecrypt_"))
-      //       .addButton(secondaryBtn_("Home", "onCardBack_"))
-      //   )
-      // )
+      .addSection(
+        CardService.newCardSection().addWidget(
+          CardService.newButtonSet()
+            .addButton(secondaryBtn_("Refresh", "onRefreshAutoDecrypt_"))
+            .addButton(secondaryBtn_("Home", "onCardBack_"))
+        )
+      )
       .build();
   }
 
@@ -1062,10 +1148,10 @@ function onRefreshAutoDecrypt_(e) {
 
 function buildLinksSection_() {
   return CardService.newCardSection()
-    .setHeader("Manage your account")
+    .setHeader("More")
     .addWidget(
       CardService.newTextButton()
-        .setText("Visit our website")
+        .setText("Open admin panel")
         .setOpenLink(
           CardService.newOpenLink()
             .setUrl(ADMIN_URL)
@@ -1406,6 +1492,15 @@ function onCardBack_(e) {
     .build();
 }
 
+function onDismissComposeStatus_(e) {
+  if (typeof clearComposeSidebarStatus_ === "function") {
+    clearComposeSidebarStatus_();
+  }
+  return CardService.newActionResponseBuilder()
+    .setNavigation(CardService.newNavigation().updateCard(buildMainCard_(e)))
+    .build();
+}
+
 function getComposeDraftMeta_(e) {
   var gmail = (e && e.gmail) || {};
   var meta = (e && e.draftMetadata) || {};
@@ -1474,7 +1569,114 @@ function resolveComposeEncryptPayload_(e, gmailAccessToken) {
   };
 }
 
+function composeSendCacheKey_(to, subject) {
+  return (
+    "sds_compose_sent_" +
+    Utilities.base64EncodeWebSafe(
+      String(to || "").toLowerCase() + "|" + String(subject || "").toLowerCase()
+    ).slice(0, 80)
+  );
+}
+
+function rememberComposeSendSuccess_(result) {
+  result = result || {};
+  try {
+    var key = composeSendCacheKey_(result.firstTo || "", result.subject || "");
+    CacheService.getUserCache().put(
+      key,
+      JSON.stringify({
+        ok: true,
+        sent: true,
+        firstTo: result.firstTo || "",
+        subject: result.subject || "",
+        warning: result.warning || "",
+        oldDraftDeleted: Boolean(result.oldDraftDeleted),
+        at: Date.now(),
+      }),
+      120
+    );
+  } catch (e) {}
+}
+
+function getRecentComposeSendSuccess_(to, subject) {
+  try {
+    var key = composeSendCacheKey_(to || "", subject || "");
+    var raw = CacheService.getUserCache().get(key);
+    if (!raw) return null;
+    var data = JSON.parse(raw);
+    if (!data || !data.ok || !data.sent) return null;
+    if (Date.now() - Number(data.at || 0) > 120000) return null;
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
+
+function isMissingDraftError_(result) {
+  if (!result) return false;
+  if (result.code === "NO_DRAFTS" || result.code === "NO_DRAFT_MATCH") {
+    return true;
+  }
+  return /No drafts found|Could not match an open draft|Wait for Gmail to autosave/i.test(
+    String(result.error || "")
+  );
+}
+
+/**
+ * After a successful send the plaintext draft is deleted. A second toolbar
+ * click then hits "No drafts found" even though the mail already went out.
+ * Cache + lock turn that into a clear success.
+ */
 function runComposeEncryptAndSendCore_(e) {
+  var draftMetaEarly = getComposeDraftMeta_(e);
+  var earlyTo = "";
+  if (draftMetaEarly.to && draftMetaEarly.to.length) {
+    earlyTo =
+      normalizeEmailAddress_(draftMetaEarly.to[0]) ||
+      String(draftMetaEarly.to[0]).trim();
+  }
+  var earlySubject = draftMetaEarly.subject || "";
+
+  var lock = LockService.getUserLock();
+  var gotLock = false;
+  try {
+    gotLock = lock.tryLock(45000);
+  } catch (eLock) {
+    gotLock = false;
+  }
+
+  try {
+    var result = runComposeEncryptAndSendCoreUnlocked_(e);
+    if (!result.ok && isMissingDraftError_(result)) {
+      var recent = getRecentComposeSendSuccess_(
+        result.firstTo || earlyTo,
+        result.subject || earlySubject
+      );
+      if (recent) {
+        return {
+          ok: true,
+          sent: true,
+          sendError: "",
+          oldDraftDeleted: Boolean(recent.oldDraftDeleted),
+          warning: recent.warning || "",
+          firstTo: recent.firstTo || earlyTo,
+          subject: recent.subject || earlySubject,
+          bodyHtml: "",
+          fromCache: true,
+        };
+      }
+    }
+    return result;
+  } finally {
+    if (gotLock) {
+      try {
+        lock.releaseLock();
+      } catch (eRel) {}
+    }
+  }
+}
+
+function runComposeEncryptAndSendCoreUnlocked_(e) {
   var gate = verifyLoginAndSubscription_();
   if (!gate.ok) {
     return {
@@ -1506,6 +1708,7 @@ function runComposeEncryptAndSendCore_(e) {
     return {
       ok: false,
       error: payload.matched.error,
+      code: payload.matched.code || "",
     };
   }
   if (!payload.firstTo) {
@@ -1753,7 +1956,7 @@ function runComposeEncryptAndSendCore_(e) {
   );
 
   if (flow.ok && flow.sent) {
-    return {
+    var okResult = {
       ok: true,
       sent: true,
       sendError: "",
@@ -1763,6 +1966,8 @@ function runComposeEncryptAndSendCore_(e) {
       subject: subject,
       bodyHtml: bodyHtml,
     };
+    rememberComposeSendSuccess_(okResult);
+    return okResult;
   }
 
   // Fallback: messages.send, then delete old plaintext draft
@@ -1786,7 +1991,7 @@ function runComposeEncryptAndSendCore_(e) {
       oldDeleted = true;
     } else {
       warning =
-        "Encrypted mail sent, but the old plaintext draft could not be deleted. Discard the open compose window.";
+        "Encrypted mail sent, but the old plaintext draft could not be deleted. Close the open compose window.";
     }
   } else {
     oldDeleted = true;
@@ -1796,7 +2001,7 @@ function runComposeEncryptAndSendCore_(e) {
     gmailDraftDelete_(flow.newDraftId, accessToken);
   }
 
-  return {
+  var fallbackOk = {
     ok: true,
     sent: true,
     sendError: "",
@@ -1806,68 +2011,213 @@ function runComposeEncryptAndSendCore_(e) {
     subject: subject,
     bodyHtml: bodyHtml,
   };
+  rememberComposeSendSuccess_(fallbackOk);
+  return fallbackOk;
 }
 
-function buildComposeDirectCard_(e) {
+/** @deprecated — Gmail connect runs via openMarketplaceGmailConnect_ (sidebar). */
+function buildComposeGmailConnectCard_(e, message) {
+  return buildMainCard_(e);
+}
+
+var COMPOSE_SIDEBAR_STATUS_KEY = "SDS_COMPOSE_SIDEBAR_STATUS";
+
+function saveComposeSidebarStatus_(kind, message) {
+  try {
+    PropertiesService.getUserProperties().setProperty(
+      COMPOSE_SIDEBAR_STATUS_KEY,
+      JSON.stringify({
+        kind: String(kind || "info"),
+        message: String(message || ""),
+        at: Date.now(),
+      })
+    );
+  } catch (e) {}
+}
+
+function peekComposeSidebarStatus_() {
+  try {
+    var raw = PropertiesService.getUserProperties().getProperty(
+      COMPOSE_SIDEBAR_STATUS_KEY
+    );
+    if (!raw) return null;
+    var data = JSON.parse(raw);
+    if (!data) return null;
+    if (Date.now() - Number(data.at || 0) > 10 * 60 * 1000) {
+      clearComposeSidebarStatus_();
+      return null;
+    }
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
+
+function clearComposeSidebarStatus_() {
+  try {
+    PropertiesService.getUserProperties().deleteProperty(
+      COMPOSE_SIDEBAR_STATUS_KEY
+    );
+  } catch (e) {}
+}
+
+/**
+ * Persist status, then refresh the existing right-hand sidebar card only.
+ * Never uses browser DOM (document) — Apps Script has no DOM.
+ */
+function finishComposeInSidebar_(e, kind, message) {
+  saveComposeSidebarStatus_(kind, message);
+  var toast = String(message || "").replace(/\n/g, " ").slice(0, 220);
+  if (kind === "success") toast = "✔ " + toast;
+  else if (kind === "error") toast = "✖ " + toast;
+  else if (kind === "need_gmail") toast = "Connect Gmail to continue.";
+
+  return CardService.newActionResponseBuilder()
+    .setNotification(CardService.newNotification().setText(toast))
+    .setNavigation(
+      CardService.newNavigation().updateCard(buildMainCard_(e))
+    )
+    .build();
+}
+
+/**
+ * After Encrypt & send (Workspace-only): update sidebar and open Gmail Inbox.
+ * CardService cannot click Discard in the compose DOM; navigating to Inbox
+ * dismisses the open compose window without using the Chrome extension.
+ */
+function finishComposeSendAndCloseCompose_(e, message) {
+  saveComposeSidebarStatus_("success", message);
+  var toast = ("✔ " + String(message || "Encrypted mail sent."))
+    .replace(/\n/g, " ")
+    .slice(0, 220);
+
+  return CardService.newActionResponseBuilder()
+    .setNotification(CardService.newNotification().setText(toast))
+    .setNavigation(
+      CardService.newNavigation().updateCard(buildMainCard_(e))
+    )
+    .setOpenLink(
+      CardService.newOpenLink()
+        .setUrl("https://mail.google.com/mail/u/0/#inbox")
+        .setOpenAs(CardService.OpenAs.FULL_SIZE)
+        .setOnClose(CardService.OnClose.RELOAD)
+    )
+    .build();
+}
+
+/**
+ * Sidebar button only: encrypt & send latest draft.
+ * All progress / success / error stay in this sidebar (updateCard).
+ */
+function onSidebarEncryptAndSend_(e) {
   var valid = getValidWorkspaceAuth_();
   if (!valid) {
-    return CardService.newCardBuilder()
-      .setHeader(cardHeader_("SecureDocShare", "Login required"))
-      .addSection(buildLoginSection_(e))
-      .build();
+    return finishComposeInSidebar_(
+      e,
+      "error",
+      "Sign in to SecureDocShare first."
+    );
   }
 
-  return CardService.newCardBuilder()
-    .setHeader(cardHeader_("SecureDocShare", "Compose"))
-    .addSection(
-      CardService.newCardSection()
-        .addWidget(
-          CardService.newTextParagraph().setText(
-            "Encrypts this draft, sends the encrypted mail, and deletes the plaintext draft. Gmail uses your SecureDocShare Google OAuth client (not the Chrome extension)."
-          )
-        )
-        .addWidget(
-          CardService.newButtonSet().addButton(
-            CardService.newTextButton()
-              .setText("Encrypt & send")
-              .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-              .setOnClickAction(
-                CardService.newAction().setFunctionName(
-                  "onComposeEncryptAndSend_"
-                )
-              )
-          )
-        )
+  saveComposeSidebarStatus_(
+    "working",
+    "Encrypting and sending your draft…"
+  );
+
+  // Match the best autosaved draft via Gmail API (no compose METADATA).
+  var fakeE = { gmail: {}, draftMetadata: {} };
+
+  var result;
+  try {
+    result = runComposeEncryptAndSendCore_(fakeE);
+  } catch (err) {
+    return finishComposeInSidebar_(
+      e,
+      "error",
+      "Encrypt/send error: " +
+        String(err && err.message ? err.message : err)
+    );
+  }
+
+  if (result.needLogin) {
+    return finishComposeInSidebar_(
+      e,
+      "error",
+      result.error || "Login / subscription required."
+    );
+  }
+
+  if (
+    result.needGmailConnect ||
+    result.code === "GMAIL_NOT_CONNECTED" ||
+    /Connect Gmail|Gmail not connected|GMAIL_NOT_CONNECTED/i.test(
+      String(result.error || "")
     )
-    .build();
+  ) {
+    return finishComposeInSidebar_(
+      e,
+      "need_gmail",
+      result.error ||
+        "Connect Gmail once, then tap Encrypt & send draft again."
+    );
+  }
+
+  if (!result.ok) {
+    return finishComposeInSidebar_(e, "error", result.error || "Failed.");
+  }
+
+  if (!result.sent) {
+    return finishComposeInSidebar_(
+      e,
+      "error",
+      result.sendError || "Encrypted but send failed."
+    );
+  }
+
+  var okMsg = "Encrypted mail sent successfully.";
+  if (result.firstTo) okMsg += "\nTo: " + String(result.firstTo);
+  if (result.fromCache) okMsg += "\nAlready sent a moment ago.";
+  if (result.warning) okMsg += "\n" + String(result.warning);
+  else if (result.oldDraftDeleted) {
+    okMsg += "\nPlain text draft removed.";
+  }
+
+  return finishComposeSendAndCloseCompose_(e, okMsg);
 }
 
+/** Persist status then refresh sidebar — never return a standalone compose Card. */
+function buildComposeAppResultCard_(e, statusTitle, statusText) {
+  var kind = /^error$/i.test(String(statusTitle || ""))
+    ? "error"
+    : /^sent$/i.test(String(statusTitle || ""))
+      ? "success"
+      : "info";
+  saveComposeSidebarStatus_(kind, statusText);
+  return buildMainCard_(e);
+}
+
+/** @deprecated — composeTrigger removed; use sidebar Encrypt & send draft. */
+function handleComposeToolbarClick_(e) {
+  return onSidebarEncryptAndSend_(e);
+}
+
+/** @deprecated */
+function buildComposeDirectCard_(e) {
+  return onSidebarEncryptAndSend_(e);
+}
+
+/** @deprecated — success/error now live on the sidebar via finishComposeInSidebar_. */
 function buildComposeSentCard_(result) {
   result = result || {};
-  var lines = ["Encrypted mail sent successfully."];
+  var okMsg = "Encrypted mail sent successfully.";
+  if (result.firstTo) okMsg += "\nTo: " + String(result.firstTo);
   if (result.oldDraftDeleted) {
-    lines.push("Plain text draft removed. Please close this compose window and open a new one to send another email.");
+    okMsg += "\nPlain text draft removed.";
   } else if (result.warning) {
-    lines.push(String(result.warning));
+    okMsg += "\n" + String(result.warning);
   }
-
-  return CardService.newCardBuilder()
-    .setHeader(cardHeader_("SecureDocShare", "Sent"))
-    .addSection(
-      CardService.newCardSection()
-        .addWidget(CardService.newTextParagraph().setText(lines.join("\n")))
-        // .addWidget(
-        //   CardService.newButtonSet().addButton(
-        //     CardService.newTextButton()
-        //       .setText("Done")
-        //       .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-        //       .setOnClickAction(
-        //         CardService.newAction().setFunctionName("onComposeSentDone_")
-        //       )
-        //   )
-        // )
-    )
-    .build();
+  saveComposeSidebarStatus_("success", okMsg);
+  return buildMainCard_({});
 }
 
 function onComposeSentDone_(e) {
@@ -1878,107 +2228,40 @@ function onComposeSentDone_(e) {
     .build();
 }
 
-/** Open Google OAuth with YOUR web client — full window, asks all Gmail scopes. */
+/**
+ * Explicit Connect Gmail button only (not called from Encrypt & send).
+ * Opens Google OAuth in a browser tab — user must click Connect themselves.
+ */
 function openMarketplaceGmailConnect_(e, message) {
   var session = getWorkspaceSession_() || {};
   if (!session.token) {
-    return notify_("Sign in to SecureDocShare first.");
+    return finishComposeInSidebar_(
+      e,
+      "error",
+      "Sign in to SecureDocShare first."
+    );
   }
   var connect = apiGmailConnectUrl_(session.token);
   if (!connect.ok || !connect.url) {
-    return notify_(
+    return finishComposeInSidebar_(
+      e,
+      "error",
       connect.error ||
-        "Could not start Gmail connect. Deploy the server with /auth/gmail/connect, then try again."
+        "Could not start Gmail connect. Try again later."
     );
   }
-  return CardService.newActionResponseBuilder()
-    .setNotification(
-      CardService.newNotification().setText(
-        "Opening Google — allow Gmail access, then tap Encrypt & send again."
-      )
-    )
-    .setOpenLink(
-      CardService.newOpenLink()
-        .setUrl(connect.url)
-        .setOpenAs(CardService.OpenAs.FULL_SIZE)
-        .setOnClose(CardService.OnClose.RELOAD)
-    )
-    .build();
+  // Prefer in-sidebar Connect button; only open when this function is invoked
+  // from an explicit Connect action.
+  return finishComposeInSidebar_(
+    e,
+    "need_gmail",
+    message ||
+      "Connect Gmail once, then tap Encrypt & send draft again."
+  );
 }
 
 function onComposeEncryptAndSend_(e) {
-  var result;
-  try {
-    result = runComposeEncryptAndSendCore_(e);
-  } catch (err) {
-    return CardService.newActionResponseBuilder()
-      .setNotification(
-        CardService.newNotification().setText(
-          "Encrypt/send error: " +
-            String(err && err.message ? err.message : err)
-        )
-      )
-      .build();
-  }
-
-  if (result.needLogin) {
-    return CardService.newActionResponseBuilder()
-      .setNavigation(
-        CardService.newNavigation().updateCard(buildComposeDirectCard_(e))
-      )
-      .setNotification(
-        CardService.newNotification().setText(
-          result.error || "Login / subscription required."
-        )
-      )
-      .build();
-  }
-
-  if (result.needGmailConnect) {
-    return openMarketplaceGmailConnect_(e, result.error);
-  }
-
-  if (!result.ok) {
-    // Fallback: any Gmail-not-connected style error should open Google prompt.
-    if (
-      result.code === "GMAIL_NOT_CONNECTED" ||
-      /Connect Gmail|Gmail not connected|GMAIL_NOT_CONNECTED/i.test(
-        String(result.error || "")
-      )
-    ) {
-      return openMarketplaceGmailConnect_(e, result.error);
-    }
-    return CardService.newActionResponseBuilder()
-      .setNotification(
-        CardService.newNotification().setText(result.error || "Failed.")
-      )
-      .build();
-  }
-
-  if (!result.sent) {
-    return CardService.newActionResponseBuilder()
-      .setNotification(
-        CardService.newNotification().setText(
-          result.sendError || "Encrypted but send failed."
-        )
-      )
-      .build();
-  }
-
-  var note = "Encrypted mail sent.";
-  if (result.oldDraftDeleted) {
-    note += "";
-  } else if (result.warning) {
-    note += " " + result.warning;
-  }
-
-  return CardService.newActionResponseBuilder()
-    .setNotification(CardService.newNotification().setText(note))
-    .setStateChanged(true)
-    .setNavigation(
-      CardService.newNavigation().updateCard(buildComposeSentCard_(result))
-    )
-    .build();
+  return onSidebarEncryptAndSend_(e);
 }
 
 function buildSecureComposeBodyHtml_(cipher, meta, quotedClear) {
@@ -3241,27 +3524,40 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
   }
   const subjectWant = String(subjectHint || "").trim().toLowerCase();
 
-  const list = gmailApiRequest_(
-    "get",
-    "/gmail/v1/users/me/drafts?maxResults=30",
-    null,
-    accessToken
-  );
-  if (!list.ok) {
-    const scopeHint = /insufficient|scope/i.test(String(list.error || ""))
-      ? " Re-authorize the SecureDocShare add-on (needs Gmail modify access)."
-      : "";
-    return {
-      ok: false,
-      error: (list.error || "Cannot list drafts.") + scopeHint,
-    };
+  // Gmail often has not autosaved yet; also after a successful send the draft
+  // is deleted so a second click sees an empty list.
+  let drafts = [];
+  let listError = "";
+  const attempts = 3;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) {
+      Utilities.sleep(1000);
+    }
+    const list = gmailApiRequest_(
+      "get",
+      "/gmail/v1/users/me/drafts?maxResults=40",
+      null,
+      accessToken
+    );
+    if (!list.ok) {
+      const scopeHint = /insufficient|scope/i.test(String(list.error || ""))
+        ? " Re-authorize the SecureDocShare add-on (needs Gmail modify access)."
+        : "";
+      listError = (list.error || "Cannot list drafts.") + scopeHint;
+      continue;
+    }
+    drafts = (list.data && list.data.drafts) || [];
+    if (drafts.length) break;
   }
 
-  const drafts = (list.data && list.data.drafts) || [];
+  if (listError && !drafts.length) {
+    return { ok: false, error: listError };
+  }
   if (!drafts.length) {
     return {
       ok: false,
       error: "No drafts found. Wait for Gmail to autosave, then try again.",
+      code: "NO_DRAFTS",
     };
   }
 
@@ -3337,6 +3633,7 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
       ok: false,
       error:
         "Could not match an open draft. Add a recipient in To, wait for autosave, then try again.",
+      code: "NO_DRAFT_MATCH",
     };
   }
 

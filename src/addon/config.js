@@ -37,6 +37,10 @@ function onGmailMessage(e) {
   return buildGmailMessageCard_(e);
 }
 
+/**
+ * Not registered (composeTrigger removed). Gmail always opens a card modal for
+ * compose selectActions — Encrypt & send lives on the sidebar button instead.
+ */
 function onGmailCompose(e) {
-  return buildComposeDirectCard_(e);
+  return onSidebarEncryptAndSend_(e);
 }

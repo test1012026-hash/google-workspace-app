@@ -345,27 +345,40 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
   }
   const subjectWant = String(subjectHint || "").trim().toLowerCase();
 
-  const list = gmailApiRequest_(
-    "get",
-    "/gmail/v1/users/me/drafts?maxResults=30",
-    null,
-    accessToken
-  );
-  if (!list.ok) {
-    const scopeHint = /insufficient|scope/i.test(String(list.error || ""))
-      ? " Re-authorize the SecureDocShare add-on (needs Gmail modify access)."
-      : "";
-    return {
-      ok: false,
-      error: (list.error || "Cannot list drafts.") + scopeHint,
-    };
+  // Gmail often has not autosaved yet; also after a successful send the draft
+  // is deleted so a second click sees an empty list.
+  let drafts = [];
+  let listError = "";
+  const attempts = 3;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) {
+      Utilities.sleep(1000);
+    }
+    const list = gmailApiRequest_(
+      "get",
+      "/gmail/v1/users/me/drafts?maxResults=40",
+      null,
+      accessToken
+    );
+    if (!list.ok) {
+      const scopeHint = /insufficient|scope/i.test(String(list.error || ""))
+        ? " Re-authorize the SecureDocShare add-on (needs Gmail modify access)."
+        : "";
+      listError = (list.error || "Cannot list drafts.") + scopeHint;
+      continue;
+    }
+    drafts = (list.data && list.data.drafts) || [];
+    if (drafts.length) break;
   }
 
-  const drafts = (list.data && list.data.drafts) || [];
+  if (listError && !drafts.length) {
+    return { ok: false, error: listError };
+  }
   if (!drafts.length) {
     return {
       ok: false,
       error: "No drafts found. Wait for Gmail to autosave, then try again.",
+      code: "NO_DRAFTS",
     };
   }
 
@@ -441,6 +454,7 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken) {
       ok: false,
       error:
         "Could not match an open draft. Add a recipient in To, wait for autosave, then try again.",
+      code: "NO_DRAFT_MATCH",
     };
   }
 

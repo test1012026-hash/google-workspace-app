@@ -61,9 +61,71 @@ function buildMainCard_(e) {
       .build();
   }
 
+  var status =
+    typeof peekComposeSidebarStatus_ === "function"
+      ? peekComposeSidebarStatus_()
+      : null;
+  var subtitle = "Ready";
+  if (status && status.kind === "success") subtitle = "Sent";
+  else if (status && status.kind === "error") subtitle = "Error";
+  else if (status && status.kind === "working") subtitle = "Working…";
+  else if (status && status.kind === "need_gmail") subtitle = "Connect Gmail";
+
   var card = CardService.newCardBuilder().setHeader(
-    cardHeader_("SecureDocShare", "Ready")
+    cardHeader_("SecureDocShare", subtitle)
   );
+
+  if (status && status.message) {
+    var statusHeader =
+      status.kind === "success"
+        ? "✔ SUCCESS"
+        : status.kind === "error"
+          ? "✖ ERROR"
+          : status.kind === "need_gmail"
+            ? "Connect Gmail"
+            : status.kind === "working"
+              ? "Working…"
+              : "Status";
+    var statusSection = CardService.newCardSection()
+      .setHeader(statusHeader)
+      .addWidget(
+        CardService.newTextParagraph().setText(String(status.message))
+      );
+
+    if (status.kind === "need_gmail") {
+      var session = valid.session || {};
+      var connect = session.token
+        ? apiGmailConnectUrl_(session.token)
+        : { ok: false };
+      if (connect.ok && connect.url) {
+        statusSection.addWidget(
+          CardService.newButtonSet().addButton(
+            CardService.newTextButton()
+              .setText("Connect Gmail")
+              .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+              .setOpenLink(
+                CardService.newOpenLink()
+                  .setUrl(connect.url)
+                  .setOpenAs(CardService.OpenAs.FULL_SIZE)
+                  .setOnClose(CardService.OnClose.RELOAD)
+              )
+          )
+        );
+      }
+    }
+
+    statusSection.addWidget(
+      CardService.newButtonSet().addButton(
+        CardService.newTextButton()
+          .setText("Dismiss")
+          .setOnClickAction(
+            CardService.newAction().setFunctionName("onDismissComposeStatus_")
+          )
+      )
+    );
+    card.addSection(statusSection);
+  }
+
   card.addSection(buildSignedInSection_(valid.session, valid.auth));
   card.addSection(buildDecryptSection_(e));
   card.addSection(buildLinksSection_());
@@ -220,6 +282,22 @@ function buildSignedInSection_(session, prefetchedAuth) {
               : "https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/person/default/24px.svg"
           )
         )
+    )
+    .addWidget(
+      CardService.newButtonSet()
+        .addButton(
+          CardService.newTextButton()
+            .setText("Encrypt & send draft")
+            .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+            .setOnClickAction(
+              CardService.newAction().setFunctionName("onSidebarEncryptAndSend_")
+            )
+        )
+    )
+    .addWidget(
+      CardService.newTextParagraph().setText(
+        "Uses your open Gmail draft. Progress and result stay in this sidebar."
+      )
     )
     .addWidget(
       CardService.newButtonSet()
