@@ -636,7 +636,7 @@ function checkSenderSubscription(options) {
 
   const qs = "?email=" + encodeURIComponent(String(email).trim().toLowerCase());
 
-  return apiRequest(baseUrl, "/public/subscription-check" + qs, {}).then(
+  return apiRequest(baseUrl, "/files/subscription-check" + qs, {}).then(
     function (out) {
       const res = out.res;
       const data = out.data || {};

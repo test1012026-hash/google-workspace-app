@@ -124,7 +124,7 @@ function guessDecryptedFileName(name, mimeType) {
 
 /**
  * Decrypt message and/or file cipher text for recipient.
- * POST /public/decrypt
+ * POST /files/decrypt
  */
 function decryptOnly(options) {
   options = options || {};
@@ -166,7 +166,7 @@ function decryptOnly(options) {
   if (msgCipher) body.messageCipherText = msgCipher;
   if (fileCipher) body.fileCipherText = fileCipher;
 
-  return apiRequest(baseUrl, "/public/decrypt", {
+  return apiRequest(baseUrl, "/files/decrypt", {
     method: "POST",
     body: body,
   }).then(function (out) {

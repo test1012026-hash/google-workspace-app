@@ -255,11 +255,11 @@ function apiEncrypt_(to, subject, message, token, fileOpts) {
 }
 
 /**
- * Admin blocked extensions (same /public/file-policy as Outlook).
+ * Admin blocked extensions (same /files/file-policy as Outlook).
  */
 function apiFetchBlockedFileExtensions_() {
   try {
-    var res = UrlFetchApp.fetch(API_BASE + "/public/file-policy", {
+    var res = UrlFetchApp.fetch(API_BASE + "/files/file-policy", {
       method: "get",
       muteHttpExceptions: true,
     });
@@ -391,7 +391,7 @@ function apiDecrypt_(options) {
     if (options.token) {
       headers.Authorization = "Bearer " + options.token;
     }
-    var res = UrlFetchApp.fetch(API_BASE + "/public/decrypt", {
+    var res = UrlFetchApp.fetch(API_BASE + "/files/decrypt", {
       method: "post",
       contentType: "application/json",
       headers: headers,

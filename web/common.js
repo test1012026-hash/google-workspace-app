@@ -90,8 +90,15 @@ function apiRequest(baseUrl, path, options) {
   if (options.body !== undefined) {
     headers["Content-Type"] = "application/json";
   }
-  if (options.token) {
-    headers.Authorization = "Bearer " + options.token;
+  let token = options.token;
+  if (!token && typeof getStoredSession === "function") {
+    try {
+      const session = getStoredSession();
+      if (session && session.token) token = session.token;
+    } catch (e) {}
+  }
+  if (token) {
+    headers.Authorization = "Bearer " + token;
   }
 
   return fetch(resolveApiUrl(baseUrl, path), {
@@ -747,7 +754,7 @@ function checkSenderSubscription(options) {
 
   const qs = "?email=" + encodeURIComponent(String(email).trim().toLowerCase());
 
-  return apiRequest(baseUrl, "/public/subscription-check" + qs, {}).then(
+  return apiRequest(baseUrl, "/files/subscription-check" + qs, {}).then(
     function (out) {
       const res = out.res;
       const data = out.data || {};
@@ -926,7 +933,7 @@ function guessDecryptedFileName(name, mimeType) {
 
 /**
  * Decrypt message and/or file cipher text for recipient.
- * POST /public/decrypt
+ * POST /files/decrypt
  */
 function decryptOnly(options) {
   options = options || {};
@@ -968,7 +975,7 @@ function decryptOnly(options) {
   if (msgCipher) body.messageCipherText = msgCipher;
   if (fileCipher) body.fileCipherText = fileCipher;
 
-  return apiRequest(baseUrl, "/public/decrypt", {
+  return apiRequest(baseUrl, "/files/decrypt", {
     method: "POST",
     body: body,
   }).then(function (out) {

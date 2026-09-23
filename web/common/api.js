@@ -90,8 +90,15 @@ function apiRequest(baseUrl, path, options) {
   if (options.body !== undefined) {
     headers["Content-Type"] = "application/json";
   }
-  if (options.token) {
-    headers.Authorization = "Bearer " + options.token;
+  let token = options.token;
+  if (!token && typeof getStoredSession === "function") {
+    try {
+      const session = getStoredSession();
+      if (session && session.token) token = session.token;
+    } catch (e) {}
+  }
+  if (token) {
+    headers.Authorization = "Bearer " + token;
   }
 
   return fetch(resolveApiUrl(baseUrl, path), {

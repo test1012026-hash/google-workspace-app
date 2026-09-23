@@ -983,6 +983,10 @@ function onHomeDownloadPdf_(e) {
         (fileInfo &&
           (fileInfo.dataBase64 || fileInfo.base64 || fileInfo.data)) ||
         null;
+      // Skip message-only packages (.securemsg) — those belong in Message, not Files.
+      if (!dataB64 && fileDec.message) {
+        continue;
+      }
       if (!dataB64) {
         failCount += 1;
         section.addWidget(
@@ -1111,13 +1115,13 @@ function buildAutoDecryptCard_(e, session, scan) {
       .setHeader(cardHeader_("SecureDocShare", "Decrypt failed"))
       .addSection(statusSection)
       .addSection(buildSignedInSection_(session, auth))
-      .addSection(
-        CardService.newCardSection().addWidget(
-          CardService.newButtonSet()
-            .addButton(secondaryBtn_("Refresh", "onRefreshAutoDecrypt_"))
-            .addButton(secondaryBtn_("Home", "onCardBack_"))
-        )
-      )
+      // .addSection(
+      //   CardService.newCardSection().addWidget(
+      //     CardService.newButtonSet()
+      //       .addButton(secondaryBtn_("Refresh", "onRefreshAutoDecrypt_"))
+      //       .addButton(secondaryBtn_("Home", "onCardBack_"))
+      //   )
+      // )
       .build();
   }
 
@@ -1198,24 +1202,26 @@ function buildAutoDecryptCard_(e, session, scan) {
         continue;
       }
 
-      if (fileDec.message) {
-        hasFileUi = true;
-        filesSection.addWidget(
-          statusRow_("Attachment included message text", true)
-        );
-        addDecryptedMessagePreview_(
-          filesSection,
-          "auto_att_msg_" + i,
-          "From " + (att.name || "attachment"),
-          String(fileDec.message)
-        );
-      }
-
       var fileInfo = fileDec.file || null;
       var dataB64 =
         (fileInfo &&
           (fileInfo.dataBase64 || fileInfo.base64 || fileInfo.data)) ||
         null;
+      var attMessage = fileDec.message ? String(fileDec.message) : "";
+
+      // Message-only packages (.securemsg / cipher-as-attachment): show once
+      // under Message — never duplicate under Files.
+      if (attMessage && !hasMessageUi) {
+        hasMessageUi = true;
+        messageSection.addWidget(statusRow_("Message decrypted", true));
+        addDecryptedMessagePreview_(
+          messageSection,
+          "auto_att_msg_" + i,
+          "Decrypted message",
+          attMessage
+        );
+      }
+
       if (dataB64) {
         hasFileUi = true;
         var meta = normalizeDecryptedFileMeta_(
@@ -1227,7 +1233,7 @@ function buildAutoDecryptCard_(e, session, scan) {
         if (ready.ok && ready.downloadUrl) {
           filesSection.addWidget(
             CardService.newDecoratedText()
-              .setTopLabel("File ready")
+              .setTopLabel("Attachment")
               .setText(meta.name)
               .setBottomLabel("From " + (att.name || "secure file"))
               .setWrapText(true)
@@ -1235,7 +1241,7 @@ function buildAutoDecryptCard_(e, session, scan) {
           filesSection.addWidget(
             CardService.newButtonSet().addButton(
               CardService.newTextButton()
-                .setText("⬇ Download")
+                .setText("⬇ Download file")
                 .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
                 .setOpenLink(
                   CardService.newOpenLink()
@@ -1254,7 +1260,7 @@ function buildAutoDecryptCard_(e, session, scan) {
             )
           );
         }
-      } else if (!fileDec.message) {
+      } else if (!attMessage) {
         hasFileUi = true;
         anyFailed = true;
         filesSection.addWidget(
@@ -1265,6 +1271,7 @@ function buildAutoDecryptCard_(e, session, scan) {
           )
         );
       }
+      // else: message-only attachment already handled in Message section — skip Files.
     } catch (fileErr) {
       hasFileUi = true;
       anyFailed = true;
@@ -1302,13 +1309,13 @@ function buildAutoDecryptCard_(e, session, scan) {
   if (hasMessageUi) builder.addSection(messageSection);
   if (hasFileUi) builder.addSection(filesSection);
   builder.addSection(buildSignedInSection_(session, auth));
-  builder.addSection(
-    CardService.newCardSection().addWidget(
-      CardService.newButtonSet()
-        .addButton(secondaryBtn_("Refresh", "onRefreshAutoDecrypt_"))
-        .addButton(secondaryBtn_("Home", "onCardBack_"))
-    )
-  );
+  // builder.addSection(
+  //   CardService.newCardSection().addWidget(
+  //     CardService.newButtonSet()
+  //       .addButton(secondaryBtn_("Refresh", "onRefreshAutoDecrypt_"))
+  //       .addButton(secondaryBtn_("Home", "onCardBack_"))
+  //   )
+  // );
   builder.addSection(buildLinksSection_());
   return builder.build();
 }
@@ -3220,11 +3227,11 @@ function apiEncrypt_(to, subject, message, token, fileOpts) {
 }
 
 /**
- * Admin blocked extensions (same /public/file-policy as Outlook).
+ * Admin blocked extensions (same /files/file-policy as Outlook).
  */
 function apiFetchBlockedFileExtensions_() {
   try {
-    var res = UrlFetchApp.fetch(API_BASE + "/public/file-policy", {
+    var res = UrlFetchApp.fetch(API_BASE + "/files/file-policy", {
       method: "get",
       muteHttpExceptions: true,
     });
@@ -3356,7 +3363,7 @@ function apiDecrypt_(options) {
     if (options.token) {
       headers.Authorization = "Bearer " + options.token;
     }
-    var res = UrlFetchApp.fetch(API_BASE + "/public/decrypt", {
+    var res = UrlFetchApp.fetch(API_BASE + "/files/decrypt", {
       method: "post",
       contentType: "application/json",
       headers: headers,
