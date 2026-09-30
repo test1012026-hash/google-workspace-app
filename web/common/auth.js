@@ -1,3 +1,6 @@
+/** In-memory fallback when Safari / private mode blocks localStorage. */
+var _memorySession = null;
+
 function getLoginWebUrl() {
   if (typeof SecureDocConfig !== "undefined" && SecureDocConfig.getLoginWebUrl) {
     return SecureDocConfig.getLoginWebUrl();
@@ -23,7 +26,7 @@ function readSessionFromLocal() {
 }
 
 function getStoredSession() {
-  return readSessionFromLocal();
+  return readSessionFromLocal() || _memorySession || null;
 }
 
 function saveSession(session) {
@@ -33,6 +36,7 @@ function saveSession(session) {
     email: session && session.email ? String(session.email) : "",
     savedAt: new Date().toISOString(),
   };
+  _memorySession = data.token ? data : null;
   try {
     if (typeof localStorage !== "undefined") {
       localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(data));
@@ -42,6 +46,7 @@ function saveSession(session) {
 }
 
 function clearSession() {
+  _memorySession = null;
   try {
     if (typeof localStorage !== "undefined") {
       localStorage.removeItem(SESSION_STORAGE_KEY);
@@ -498,15 +503,27 @@ function loginWithOAuthPopup_(options) {
     }
 
     window.addEventListener("message", onMessage);
+    // Open during the user gesture so Safari/Chrome do not block the popup.
     popup = window.open(start, "securedoc_oauth", "width=520,height=680");
     if (!popup) {
-      settle(
-        failure(500, {
-          error: "Popup blocked. Allow popups for this site and try again.",
-          code: "OAUTH_POPUP_BLOCKED",
-        })
-      );
-      return;
+      // Last resort: top-level navigation (works in strict iframe sandboxes).
+      try {
+        if (window.top && window.top !== window) {
+          window.top.location.href = start;
+        } else {
+          window.location.href = start;
+        }
+        return;
+      } catch (navErr) {
+        settle(
+          failure(500, {
+            error:
+              "Popup blocked. Allow popups for Gmail / SecureDocShare, then try again.",
+            code: "OAUTH_POPUP_BLOCKED",
+          })
+        );
+        return;
+      }
     }
     try {
       popup.focus();

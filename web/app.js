@@ -31,32 +31,94 @@ var _sessionEmail = "";
 var _subscriptionActive = false;
 var _sessionToken = "";
 var SIGNUP_DRAFT_KEY = "sds_workspace_signup_draft";
+var _signupDraftMemory = null;
+
+/**
+ * Open an OAuth / grant-access URL in a way that works in Safari, Chrome, Firefox.
+ * Prefer a window opened during the click gesture; never rely on iframe → accounts.google.com.
+ */
+function openExternalAuthUrl_(url, existingWin) {
+  var target = String(url || "");
+  if (!target) return false;
+
+  if (existingWin && !existingWin.closed) {
+    try {
+      existingWin.location.href = target;
+      try {
+        existingWin.focus();
+      } catch (e0) {}
+      return true;
+    } catch (e1) {}
+  }
+
+  var win = null;
+  try {
+    win = window.open(target, "_blank");
+  } catch (e2) {
+    win = null;
+  }
+  if (win) {
+    try {
+      win.focus();
+    } catch (e3) {}
+    return true;
+  }
+
+  try {
+    var a = document.createElement("a");
+    a.href = target;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () {
+      try {
+        document.body.removeChild(a);
+      } catch (e4) {}
+    }, 0);
+    return true;
+  } catch (e5) {}
+
+  try {
+    window.location.href = target;
+    return true;
+  } catch (e6) {}
+
+  return false;
+}
+
+function openAuthPlaceholderWindow_() {
+  try {
+    return window.open("about:blank", "securedoc_google_oauth");
+  } catch (e) {
+    return null;
+  }
+}
 
 function saveSignupDraft_(email, password, acceptTerms) {
+  var payload = {
+    email: String(email || "").trim(),
+    password: String(password || ""),
+    acceptTerms: Boolean(acceptTerms),
+    otpSent: Boolean(_signupOtpSent),
+  };
+  _signupDraftMemory = payload;
   try {
-    sessionStorage.setItem(
-      SIGNUP_DRAFT_KEY,
-      JSON.stringify({
-        email: String(email || "").trim(),
-        password: String(password || ""),
-        acceptTerms: Boolean(acceptTerms),
-        otpSent: Boolean(_signupOtpSent),
-      })
-    );
+    sessionStorage.setItem(SIGNUP_DRAFT_KEY, JSON.stringify(payload));
   } catch (e) {}
 }
 
 function loadSignupDraft_() {
   try {
     var raw = sessionStorage.getItem(SIGNUP_DRAFT_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch (e) {
-    return null;
-  }
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return _signupDraftMemory || null;
 }
 
 function clearSignupDraft_() {
+  _signupDraftMemory = null;
   try {
     sessionStorage.removeItem(SIGNUP_DRAFT_KEY);
   } catch (e) {}
@@ -164,12 +226,19 @@ function handleOAuthTicketQuery_() {
   }
 
   function notifyOpenerAndClose_(payload) {
+    var msg = { type: "securedoc-oauth" };
+    try {
+      if (payload && typeof payload === "object") {
+        for (var k in payload) {
+          if (Object.prototype.hasOwnProperty.call(payload, k)) {
+            msg[k] = payload[k];
+          }
+        }
+      }
+    } catch (eMerge) {}
     try {
       if (window.opener && !window.opener.closed) {
-        window.opener.postMessage(
-          Object.assign({ type: "securedoc-oauth" }, payload),
-          "*"
-        );
+        window.opener.postMessage(msg, "*");
       }
     } catch (e3) {}
     setTimeout(function () {
@@ -279,22 +348,29 @@ function handleSsoLaunchQuery_() {
     gate.textContent = "Opening Google sign-in…";
   }
   setSsoBusy(true);
+  var authWin = openAuthPlaceholderWindow_();
 
   google.script.run
     .withSuccessHandler(function (url) {
       setSsoBusy(false);
       if (!url) {
+        try {
+          if (authWin && !authWin.closed) authWin.close();
+        } catch (eClose) {}
         setLoginError("Could not start Google sign-in.");
         return;
       }
-      try {
-        window.top.location.href = url;
-      } catch (e2) {
-        window.location.href = url;
+      if (!openExternalAuthUrl_(url, authWin)) {
+        setLoginError(
+          "Could not open Google sign-in. Allow popups for Gmail, then try again."
+        );
       }
     })
     .withFailureHandler(function (err) {
       setSsoBusy(false);
+      try {
+        if (authWin && !authWin.closed) authWin.close();
+      } catch (eClose2) {}
       setLoginError((err && err.message) || String(err));
     })
     .getGoogleLoginUrl({ intent: intent, acceptTerms: acceptTerms || intent === "signup" });
@@ -455,6 +531,10 @@ function onSsoClick(ev) {
   setLoginError("");
   setSsoBusy(true);
 
+  // Open during the click gesture so Safari does not treat the later
+  // navigation as a blocked popup (google.script.run is async).
+  var authWin = openAuthPlaceholderWindow_();
+
   // Apps Script OAuth2 (OpenID) — not browser-trusted email.
   if (
     typeof google !== "undefined" &&
@@ -466,17 +546,23 @@ function onSsoClick(ev) {
       .withSuccessHandler(function (url) {
         setSsoBusy(false);
         if (!url) {
+          try {
+            if (authWin && !authWin.closed) authWin.close();
+          } catch (eClose) {}
           setLoginError("Could not start Google sign-in.");
           return;
         }
-        try {
-          window.top.location.href = url;
-        } catch (e) {
-          window.location.href = url;
+        if (!openExternalAuthUrl_(url, authWin)) {
+          setLoginError(
+            "Could not open Google sign-in. Allow popups for Gmail, then try again."
+          );
         }
       })
       .withFailureHandler(function (err) {
         setSsoBusy(false);
+        try {
+          if (authWin && !authWin.closed) authWin.close();
+        } catch (eClose2) {}
         setLoginError((err && err.message) || String(err) || "Google sign-in failed");
       })
       .getGoogleLoginUrl({
@@ -486,6 +572,9 @@ function onSsoClick(ev) {
     return;
   }
 
+  try {
+    if (authWin && !authWin.closed) authWin.close();
+  } catch (eClose3) {}
   setSsoBusy(false);
   setLoginError("Google sign-in is only available inside the Workspace app.");
 }

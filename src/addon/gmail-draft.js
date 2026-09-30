@@ -438,10 +438,15 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken, opts) {
       body: body,
       ccHeader: getMimeHeader_(headers, "Cc"),
       bccHeader: getMimeHeader_(headers, "Bcc"),
+      inReplyTo: getMimeHeader_(headers, "In-Reply-To"),
+      references: getMimeHeader_(headers, "References"),
       payload: payload,
       score: score,
       internalDate: internalDate,
       isEncryptedBody: isEncryptedBody,
+      isReplyOrForward:
+        /^(re|fw|fwd)\s*:/i.test(subjNorm) ||
+        Boolean(getMimeHeader_(headers, "In-Reply-To")),
     };
   }
 
@@ -606,6 +611,21 @@ function buildRfc822EncryptedMime_(options) {
   if (options.from) {
     headerLines.unshift("From: " + sanitizeMimeHeader_(options.from));
   }
+  // Reply/forward threading — keep encrypted mail under the parent conversation.
+  if (options.inReplyTo) {
+    headerLines.push(
+      "In-Reply-To: " + sanitizeMimeHeader_(options.inReplyTo)
+    );
+  }
+  if (options.references) {
+    headerLines.push(
+      "References: " + sanitizeMimeHeader_(options.references)
+    );
+  } else if (options.inReplyTo) {
+    headerLines.push(
+      "References: " + sanitizeMimeHeader_(options.inReplyTo)
+    );
+  }
 
   const altParts = [
     "--" + altBoundary,
@@ -676,13 +696,16 @@ function encodeRawMime_(rfc822) {
 }
 
 /** Create a draft with recipient, subject, and encrypted body. */
-function gmailDraftCreate_(options, accessToken) {
+function gmailDraftCreate_(options, accessToken, draftMeta) {
+  draftMeta = draftMeta || {};
   const rfc822 = buildRfc822EncryptedMime_(options);
   const raw = encodeRawMime_(rfc822);
+  const message = { raw: raw };
+  if (draftMeta.threadId) message.threadId = String(draftMeta.threadId);
   return gmailApiRequest_(
     "post",
     "/gmail/v1/users/me/drafts",
-    { message: { raw: raw } },
+    { message: message },
     accessToken
   );
 }
@@ -736,7 +759,7 @@ function gmailReplaceDraftWithEncrypted_(oldDraftId, mimeOpts, accessToken, draf
     }
   }
 
-  const created = gmailDraftCreate_(mimeOpts, accessToken);
+  const created = gmailDraftCreate_(mimeOpts, accessToken, draftMeta || {});
   if (!created.ok || !created.data) {
     return {
       ok: false,
@@ -802,14 +825,44 @@ function gmailDraftDelete_(draftId, accessToken) {
 
 /**
  * Create encrypted draft → send it → delete old plaintext draft.
+ * Pass draftMeta.threadId so reply/forward stays in the parent thread.
  * Returns { ok, newDraftId, sent, oldDeleted, error, sendError }.
  */
 function gmailCreateEncryptedDraftSendAndCleanup_(
   oldDraftId,
   mimeOpts,
-  accessToken
+  accessToken,
+  draftMeta
 ) {
-  const created = gmailDraftCreate_(mimeOpts, accessToken);
+  draftMeta = draftMeta || {};
+
+  // Prefer updating the open Reply/Forward draft in place, then send it.
+  // That keeps Gmail's threadId + In-Reply-To from the compose window.
+  if (oldDraftId) {
+    const replaced = gmailReplaceDraftWithEncrypted_(
+      oldDraftId,
+      mimeOpts,
+      accessToken,
+      draftMeta
+    );
+    if (replaced.ok && replaced.draftId) {
+      const sentInPlace = gmailDraftSend_(replaced.draftId, accessToken);
+      if (sentInPlace.ok) {
+        return {
+          ok: true,
+          newDraftId: replaced.draftId,
+          sent: true,
+          oldDeleted: Boolean(replaced.updated) || Boolean(replaced.oldDeleted),
+          error: replaced.error || "",
+          sendError: "",
+          threaded: true,
+        };
+      }
+      // Fall through to create+send if drafts.send on updated draft failed.
+    }
+  }
+
+  const created = gmailDraftCreate_(mimeOpts, accessToken, draftMeta);
   if (!created.ok || !created.data) {
     return {
       ok: false,
@@ -835,7 +888,6 @@ function gmailCreateEncryptedDraftSendAndCleanup_(
 
   const sentRes = gmailDraftSend_(newDraftId, accessToken);
   if (!sentRes.ok) {
-    // Leave the encrypted draft for the user; do not delete plaintext yet.
     return {
       ok: false,
       newDraftId: newDraftId,
@@ -866,13 +918,17 @@ function gmailCreateEncryptedDraftSendAndCleanup_(
     oldDeleted: oldDeleted,
     error: deleteError,
     sendError: "",
+    threaded: Boolean(draftMeta.threadId),
   };
 }
 
-function gmailMessagesSendWithToken_(accessToken, options) {
+function gmailMessagesSendWithToken_(accessToken, options, draftMeta) {
   try {
+    draftMeta = draftMeta || {};
     const rfc822 = buildRfc822EncryptedMime_(options);
     const raw = encodeRawMime_(rfc822);
+    const body = { raw: raw };
+    if (draftMeta.threadId) body.threadId = String(draftMeta.threadId);
     const res = UrlFetchApp.fetch(
       "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
       {
@@ -882,7 +938,7 @@ function gmailMessagesSendWithToken_(accessToken, options) {
           Authorization: "Bearer " + accessToken,
           Accept: "application/json",
         },
-        payload: JSON.stringify({ raw: raw }),
+        payload: JSON.stringify(body),
         muteHttpExceptions: true,
       }
     );
@@ -924,6 +980,10 @@ function buildSecureComposeBodyText_(cipher, meta, quotedClear) {
   const quote = String(quotedClear || "").trim();
   if (quote) {
     lines.push("");
+    // quotedClear may already include the "Previous message" label.
+    if (!/^----- (Previous|Original) message/i.test(quote)) {
+      lines.push("----- Previous message (decrypted) -----");
+    }
     lines.push(quote);
   }
   return lines.join("\n");

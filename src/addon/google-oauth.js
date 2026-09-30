@@ -209,37 +209,47 @@ function authCallback(request) {
     PropertiesService.getUserProperties().deleteProperty(GOOGLE_OAUTH_INTENT_KEY);
   } catch (e4) {}
 
-  // Land on the Workspace web app (not script.google.com/home).
-  var appUrl = String(WEB_APP_URL || "").split("?")[0];
-  if (appUrl) {
-    return HtmlService.createHtmlOutput(
-      "<!DOCTYPE html><html><body style='font-family:system-ui,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
-        "<p style='font-size:18px;font-weight:700'>SecureDocShare</p>" +
-        "<p style='color:#2bb3a0'>Signed in as " +
-        escapeHtml_(login.email || "user") +
-        "</p>" +
-        "<p style='color:#9db4bd'>Please go back to Gmail and refresh the page to continue.</p>" +
-        "<script>window.top.location.replace(" +
-        JSON.stringify(appUrl) +
-        ");</script>" +
-        "<p><a style='color:#2bb3a0' href='" +
-        escapeHtml_(appUrl) +
-        "'>Continue</a></p>" +
-        "</body></html>"
-    ).setTitle("Signed in");
-  }
-
+  // Land on a Safari/Chrome-safe success page (no iframe top-navigation).
   return googleOAuthResultPage_(true, login.email || "Signed in");
+}
+
+function googleOAuthCloseScript_() {
+  return (
+    "<script>(function(){" +
+    "function tryClose(){" +
+    "try{if(window.opener&&!window.opener.closed){try{window.opener.postMessage({type:'securedoc-oauth',ok:true},'*');}catch(e0){}}" +
+    "try{window.close();}catch(e1){}" +
+    "setTimeout(function(){" +
+    "var b=document.getElementById('sds-close-btn');" +
+    "var h=document.getElementById('sds-close-hint');" +
+    "if(b){b.textContent='Close this tab and return to Gmail';}" +
+    "if(h){h.style.display='block';}" +
+    "},500);" +
+    "}catch(e){}" +
+    "}" +
+    "setTimeout(tryClose,800);" +
+    "})();</script>"
+  );
 }
 
 function googleOAuthResultPage_(success, detail) {
   var title = success ? "Signed in" : "Sign-in failed";
   var color = success ? "#2bb3a0" : "#ff6b7a";
   var msg = success
-    ? "Signed in as " + escapeHtml_(detail) + ". Close this window and return to Gmail."
+    ? "Signed in as " +
+      escapeHtml_(detail) +
+      ". You can close this tab and return to Gmail — then refresh SecureDocShare."
     : escapeHtml_(detail);
+  var button = success
+    ? "<p><button id='sds-close-btn' type='button' onclick='try{window.close();}catch(e){}' " +
+      "style='background:#2bb3a0;color:#0f1c24;border:0;border-radius:8px;padding:10px 16px;font-weight:700;cursor:pointer'>" +
+      "Close tab</button></p>" +
+      "<p id='sds-close-hint' style='display:none;color:#9db4bd'>If the tab did not close, close it manually and reopen SecureDocShare in Gmail.</p>"
+    : "";
   return HtmlService.createHtmlOutput(
-    "<!DOCTYPE html><html><body style='font-family:system-ui,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'>" +
+      "<meta name='viewport' content='width=device-width, initial-scale=1'>" +
+      "</head><body style='font-family:system-ui,-apple-system,BlinkMacSystemFont,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
       "<p style='font-size:18px;font-weight:700'>SecureDocShare</p>" +
       "<h2 style='color:" +
       color +
@@ -249,7 +259,8 @@ function googleOAuthResultPage_(success, detail) {
       "<p>" +
       msg +
       "</p>" +
-      "<script>setTimeout(function(){try{window.close();}catch(e){}},1200);</script>" +
+      button +
+      (success ? googleOAuthCloseScript_() : "") +
       "</body></html>"
   ).setTitle(title);
 }

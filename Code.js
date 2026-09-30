@@ -33,7 +33,7 @@ const ENCRYPT_ONLY_MESSAGES = {
   LOGIN_REQUIRED: "Login or an active subscription is required.",
   GMAIL_CONNECT: "Please connect Gmail, then try Encrypt data only again.",
   ALREADY_ENCRYPTED:
-    "This draft is already encrypted. Please close the current compose window and check your Drafts folder. Wait for 1 minute first and check whether the draft is encrypted. If it is not encrypted, open a new compose window and try again.",
+    "This draft is already encrypted. Clear the message body, type a new message, wait for Gmail autosave, then try again.",
   NOTHING_TO_ENCRYPT:
     "Nothing to encrypt. Add a message or file, wait for Gmail autosave, then try again.",
   FAILED: "Could not encrypt the draft.",
@@ -300,37 +300,47 @@ function authCallback(request) {
     PropertiesService.getUserProperties().deleteProperty(GOOGLE_OAUTH_INTENT_KEY);
   } catch (e4) {}
 
-  // Land on the Workspace web app (not script.google.com/home).
-  var appUrl = String(WEB_APP_URL || "").split("?")[0];
-  if (appUrl) {
-    return HtmlService.createHtmlOutput(
-      "<!DOCTYPE html><html><body style='font-family:system-ui,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
-        "<p style='font-size:18px;font-weight:700'>SecureDocShare</p>" +
-        "<p style='color:#2bb3a0'>Signed in as " +
-        escapeHtml_(login.email || "user") +
-        "</p>" +
-        "<p style='color:#9db4bd'>Please go back to Gmail and refresh the page to continue.</p>" +
-        "<script>window.top.location.replace(" +
-        JSON.stringify(appUrl) +
-        ");</script>" +
-        "<p><a style='color:#2bb3a0' href='" +
-        escapeHtml_(appUrl) +
-        "'>Continue</a></p>" +
-        "</body></html>"
-    ).setTitle("Signed in");
-  }
-
+  // Land on a Safari/Chrome-safe success page (no iframe top-navigation).
   return googleOAuthResultPage_(true, login.email || "Signed in");
+}
+
+function googleOAuthCloseScript_() {
+  return (
+    "<script>(function(){" +
+    "function tryClose(){" +
+    "try{if(window.opener&&!window.opener.closed){try{window.opener.postMessage({type:'securedoc-oauth',ok:true},'*');}catch(e0){}}" +
+    "try{window.close();}catch(e1){}" +
+    "setTimeout(function(){" +
+    "var b=document.getElementById('sds-close-btn');" +
+    "var h=document.getElementById('sds-close-hint');" +
+    "if(b){b.textContent='Close this tab and return to Gmail';}" +
+    "if(h){h.style.display='block';}" +
+    "},500);" +
+    "}catch(e){}" +
+    "}" +
+    "setTimeout(tryClose,800);" +
+    "})();</script>"
+  );
 }
 
 function googleOAuthResultPage_(success, detail) {
   var title = success ? "Signed in" : "Sign-in failed";
   var color = success ? "#2bb3a0" : "#ff6b7a";
   var msg = success
-    ? "Signed in as " + escapeHtml_(detail) + ". Close this window and return to Gmail."
+    ? "Signed in as " +
+      escapeHtml_(detail) +
+      ". You can close this tab and return to Gmail — then refresh SecureDocShare."
     : escapeHtml_(detail);
+  var button = success
+    ? "<p><button id='sds-close-btn' type='button' onclick='try{window.close();}catch(e){}' " +
+      "style='background:#2bb3a0;color:#0f1c24;border:0;border-radius:8px;padding:10px 16px;font-weight:700;cursor:pointer'>" +
+      "Close tab</button></p>" +
+      "<p id='sds-close-hint' style='display:none;color:#9db4bd'>If the tab did not close, close it manually and reopen SecureDocShare in Gmail.</p>"
+    : "";
   return HtmlService.createHtmlOutput(
-    "<!DOCTYPE html><html><body style='font-family:system-ui,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'>" +
+      "<meta name='viewport' content='width=device-width, initial-scale=1'>" +
+      "</head><body style='font-family:system-ui,-apple-system,BlinkMacSystemFont,sans-serif;padding:24px;background:#0f1c24;color:#eef6f8'>" +
       "<p style='font-size:18px;font-weight:700'>SecureDocShare</p>" +
       "<h2 style='color:" +
       color +
@@ -340,7 +350,8 @@ function googleOAuthResultPage_(success, detail) {
       "<p>" +
       msg +
       "</p>" +
-      "<script>setTimeout(function(){try{window.close();}catch(e){}},1200);</script>" +
+      button +
+      (success ? googleOAuthCloseScript_() : "") +
       "</body></html>"
   ).setTitle(title);
 }
@@ -983,10 +994,6 @@ function onHomeDownloadPdf_(e) {
         (fileInfo &&
           (fileInfo.dataBase64 || fileInfo.base64 || fileInfo.data)) ||
         null;
-      // Skip message-only packages (.securemsg) — those belong in Message, not Files.
-      if (!dataB64 && fileDec.message) {
-        continue;
-      }
       if (!dataB64) {
         failCount += 1;
         section.addWidget(
@@ -1410,8 +1417,14 @@ function onCardGoogleSignIn_(e) {
     .setOpenLink(
       CardService.newOpenLink()
         .setUrl(url)
+        // FULL_SIZE is required so Google OAuth is not framed (Safari blocks that).
         .setOpenAs(CardService.OpenAs.FULL_SIZE)
         .setOnClose(CardService.OnClose.RELOAD_ADD_ON)
+    )
+    .setNotification(
+      CardService.newNotification().setText(
+        "Complete Google sign-in in the new tab, then return here."
+      )
     )
     .build();
 }
@@ -2095,16 +2108,18 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
       messageToEncrypt = extractForwardPlainMessage_(quotedClear);
       quotedAppendix = "";
     } else if (quotedClear) {
-      // Reply with new text: keep parent readable, without old metadata.
-      quotedAppendix = isForwardSubject
-        ? ""
-        : extractForwardPlainMessage_(quotedClear);
+      // Reply with new text: encrypt only the new reply; append decrypted parent
+      // in clear so the thread shows encrypted reply + readable parent quote.
+      var parentPlain = extractForwardPlainMessage_(quotedClear);
       if (isForwardSubject) {
         // Forward + typed note: encrypt note + parent plain together for new To.
-        var parentPlain = extractForwardPlainMessage_(quotedClear);
         messageToEncrypt = parentPlain
           ? messageToEncrypt + "\n\n" + parentPlain
           : messageToEncrypt;
+        quotedAppendix = "";
+      } else if (parentPlain) {
+        quotedAppendix = formatDecryptedParentQuote_(parentPlain, subject);
+      } else {
         quotedAppendix = "";
       }
     }
@@ -2218,6 +2233,25 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
     text: bodyText,
     attachmentName: encAttB64 ? encAttName : "",
     attachmentBase64: encAttB64 || "",
+    inReplyTo:
+      payload.matched && payload.matched.ok
+        ? payload.matched.inReplyTo || ""
+        : "",
+    references:
+      payload.matched && payload.matched.ok
+        ? payload.matched.references || ""
+        : "",
+  };
+
+  var sendDraftMeta = {
+    messageId:
+      payload.matched && payload.matched.ok
+        ? payload.matched.messageId || ""
+        : "",
+    threadId:
+      payload.matched && payload.matched.ok
+        ? payload.matched.threadId || ""
+        : "",
   };
 
   // Encrypt data only: update open draft (no send).
@@ -2230,21 +2264,11 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
         code: "NO_DRAFT_MATCH",
       };
     }
-    var draftMeta = {
-      messageId:
-        payload.matched && payload.matched.ok
-          ? payload.matched.messageId || ""
-          : "",
-      threadId:
-        payload.matched && payload.matched.ok
-          ? payload.matched.threadId || ""
-          : "",
-    };
     var replaced = gmailReplaceDraftWithEncrypted_(
       oldDraftId,
       mimeOpts,
       accessToken,
-      draftMeta
+      sendDraftMeta
     );
     if (!replaced.ok) {
       return {
@@ -2269,11 +2293,12 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
     };
   }
 
-  // 1) Create encrypted draft → 2) send → 3) delete plaintext draft
+  // 1) Update/create encrypted draft in the same thread → 2) send → 3) cleanup
   var flow = gmailCreateEncryptedDraftSendAndCleanup_(
     oldDraftId,
     mimeOpts,
-    accessToken
+    accessToken,
+    sendDraftMeta
   );
 
   if (flow.ok && flow.sent) {
@@ -2286,13 +2311,18 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
       firstTo: payload.firstTo,
       subject: subject,
       bodyHtml: bodyHtml,
+      threaded: Boolean(flow.threaded || sendDraftMeta.threadId),
     };
     rememberComposeSendSuccess_(okResult);
     return okResult;
   }
 
-  // Fallback: messages.send, then delete old plaintext draft
-  var sendRes = gmailMessagesSendWithToken_(accessToken, mimeOpts);
+  // Fallback: messages.send with threadId, then delete old plaintext draft
+  var sendRes = gmailMessagesSendWithToken_(
+    accessToken,
+    mimeOpts,
+    sendDraftMeta
+  );
   if (!sendRes.ok) {
     return {
       ok: false,
@@ -2331,6 +2361,7 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
     firstTo: payload.firstTo,
     subject: subject,
     bodyHtml: bodyHtml,
+    threaded: Boolean(sendDraftMeta.threadId),
   };
   rememberComposeSendSuccess_(fallbackOk);
   return fallbackOk;
@@ -2402,28 +2433,11 @@ function finishComposeInSidebar_(e, kind, message) {
 }
 
 /**
- * After Encrypt & send (Workspace-only): update sidebar and open Gmail Inbox.
- * CardService cannot click Discard in the compose DOM; navigating to Inbox
- * dismisses the open compose window without using the Chrome extension.
+ * After Encrypt & send: update sidebar only.
+ * Do not open Gmail Inbox / a new mail window (OpenLink FULL_SIZE).
  */
 function finishComposeSendAndCloseCompose_(e, message) {
-  saveComposeSidebarStatus_("success", message);
-  var toast = ("✔ " + String(message || "Encrypted mail sent."))
-    .replace(/\n/g, " ")
-    .slice(0, 220);
-
-  return CardService.newActionResponseBuilder()
-    .setNotification(CardService.newNotification().setText(toast))
-    .setNavigation(
-      CardService.newNavigation().updateCard(buildMainCard_(e))
-    )
-    .setOpenLink(
-      CardService.newOpenLink()
-        .setUrl("https://mail.google.com/mail/u/0/#inbox")
-        .setOpenAs(CardService.OpenAs.FULL_SIZE)
-        .setOnClose(CardService.OnClose.RELOAD)
-    )
-    .build();
+  return finishComposeInSidebar_(e, "success", message);
 }
 
 /**
@@ -2742,14 +2756,30 @@ function buildSecureComposeBodyHtml_(cipher, meta, quotedClear) {
   var quote = String(quotedClear || "").trim();
   if (quote) {
     parts.push(
-      '<div style="margin-top:16px;padding-top:12px;border-top:1px solid #dadce0;color:#5f6368;font-size:12px;line-height:1.45;white-space:pre-wrap">' +
+      '<div style="margin-top:18px;padding-top:12px;border-top:1px solid #dadce0;color:#5f6368;font-size:12px;line-height:1.45">' +
+        '<div style="margin:0 0 8px 0;font-weight:600;color:#80868b">Previous message (decrypted)</div>' +
+        '<blockquote style="margin:0;padding:0 0 0 12px;border-left:3px solid #dadce0;white-space:pre-wrap">' +
         escapeHtml_(quote).replace(/\n/g, "<br>") +
-        "</div>"
+        "</blockquote></div>"
     );
   }
 
   parts.push("</div>");
   return parts.join("");
+}
+
+/**
+ * Plain quote of decrypted parent under the encrypted reply (not re-encrypted).
+ */
+function formatDecryptedParentQuote_(parentPlain, subject) {
+  var plain = String(parentPlain || "").trim();
+  if (!plain) return "";
+  var label = "----- Previous message (decrypted) -----";
+  var subj = String(subject || "").trim();
+  if (/^re\s*:/i.test(subj)) {
+    label = "----- Original message (decrypted) -----";
+  }
+  return label + "\n" + plain;
 }
 
 /**
@@ -4049,10 +4079,15 @@ function findMatchingGmailDraft_(toEmails, subjectHint, accessToken, opts) {
       body: body,
       ccHeader: getMimeHeader_(headers, "Cc"),
       bccHeader: getMimeHeader_(headers, "Bcc"),
+      inReplyTo: getMimeHeader_(headers, "In-Reply-To"),
+      references: getMimeHeader_(headers, "References"),
       payload: payload,
       score: score,
       internalDate: internalDate,
       isEncryptedBody: isEncryptedBody,
+      isReplyOrForward:
+        /^(re|fw|fwd)\s*:/i.test(subjNorm) ||
+        Boolean(getMimeHeader_(headers, "In-Reply-To")),
     };
   }
 
@@ -4217,6 +4252,21 @@ function buildRfc822EncryptedMime_(options) {
   if (options.from) {
     headerLines.unshift("From: " + sanitizeMimeHeader_(options.from));
   }
+  // Reply/forward threading — keep encrypted mail under the parent conversation.
+  if (options.inReplyTo) {
+    headerLines.push(
+      "In-Reply-To: " + sanitizeMimeHeader_(options.inReplyTo)
+    );
+  }
+  if (options.references) {
+    headerLines.push(
+      "References: " + sanitizeMimeHeader_(options.references)
+    );
+  } else if (options.inReplyTo) {
+    headerLines.push(
+      "References: " + sanitizeMimeHeader_(options.inReplyTo)
+    );
+  }
 
   const altParts = [
     "--" + altBoundary,
@@ -4287,13 +4337,16 @@ function encodeRawMime_(rfc822) {
 }
 
 /** Create a draft with recipient, subject, and encrypted body. */
-function gmailDraftCreate_(options, accessToken) {
+function gmailDraftCreate_(options, accessToken, draftMeta) {
+  draftMeta = draftMeta || {};
   const rfc822 = buildRfc822EncryptedMime_(options);
   const raw = encodeRawMime_(rfc822);
+  const message = { raw: raw };
+  if (draftMeta.threadId) message.threadId = String(draftMeta.threadId);
   return gmailApiRequest_(
     "post",
     "/gmail/v1/users/me/drafts",
-    { message: { raw: raw } },
+    { message: message },
     accessToken
   );
 }
@@ -4347,7 +4400,7 @@ function gmailReplaceDraftWithEncrypted_(oldDraftId, mimeOpts, accessToken, draf
     }
   }
 
-  const created = gmailDraftCreate_(mimeOpts, accessToken);
+  const created = gmailDraftCreate_(mimeOpts, accessToken, draftMeta || {});
   if (!created.ok || !created.data) {
     return {
       ok: false,
@@ -4413,14 +4466,44 @@ function gmailDraftDelete_(draftId, accessToken) {
 
 /**
  * Create encrypted draft → send it → delete old plaintext draft.
+ * Pass draftMeta.threadId so reply/forward stays in the parent thread.
  * Returns { ok, newDraftId, sent, oldDeleted, error, sendError }.
  */
 function gmailCreateEncryptedDraftSendAndCleanup_(
   oldDraftId,
   mimeOpts,
-  accessToken
+  accessToken,
+  draftMeta
 ) {
-  const created = gmailDraftCreate_(mimeOpts, accessToken);
+  draftMeta = draftMeta || {};
+
+  // Prefer updating the open Reply/Forward draft in place, then send it.
+  // That keeps Gmail's threadId + In-Reply-To from the compose window.
+  if (oldDraftId) {
+    const replaced = gmailReplaceDraftWithEncrypted_(
+      oldDraftId,
+      mimeOpts,
+      accessToken,
+      draftMeta
+    );
+    if (replaced.ok && replaced.draftId) {
+      const sentInPlace = gmailDraftSend_(replaced.draftId, accessToken);
+      if (sentInPlace.ok) {
+        return {
+          ok: true,
+          newDraftId: replaced.draftId,
+          sent: true,
+          oldDeleted: Boolean(replaced.updated) || Boolean(replaced.oldDeleted),
+          error: replaced.error || "",
+          sendError: "",
+          threaded: true,
+        };
+      }
+      // Fall through to create+send if drafts.send on updated draft failed.
+    }
+  }
+
+  const created = gmailDraftCreate_(mimeOpts, accessToken, draftMeta);
   if (!created.ok || !created.data) {
     return {
       ok: false,
@@ -4446,7 +4529,6 @@ function gmailCreateEncryptedDraftSendAndCleanup_(
 
   const sentRes = gmailDraftSend_(newDraftId, accessToken);
   if (!sentRes.ok) {
-    // Leave the encrypted draft for the user; do not delete plaintext yet.
     return {
       ok: false,
       newDraftId: newDraftId,
@@ -4477,13 +4559,17 @@ function gmailCreateEncryptedDraftSendAndCleanup_(
     oldDeleted: oldDeleted,
     error: deleteError,
     sendError: "",
+    threaded: Boolean(draftMeta.threadId),
   };
 }
 
-function gmailMessagesSendWithToken_(accessToken, options) {
+function gmailMessagesSendWithToken_(accessToken, options, draftMeta) {
   try {
+    draftMeta = draftMeta || {};
     const rfc822 = buildRfc822EncryptedMime_(options);
     const raw = encodeRawMime_(rfc822);
+    const body = { raw: raw };
+    if (draftMeta.threadId) body.threadId = String(draftMeta.threadId);
     const res = UrlFetchApp.fetch(
       "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
       {
@@ -4493,7 +4579,7 @@ function gmailMessagesSendWithToken_(accessToken, options) {
           Authorization: "Bearer " + accessToken,
           Accept: "application/json",
         },
-        payload: JSON.stringify({ raw: raw }),
+        payload: JSON.stringify(body),
         muteHttpExceptions: true,
       }
     );
@@ -4535,6 +4621,10 @@ function buildSecureComposeBodyText_(cipher, meta, quotedClear) {
   const quote = String(quotedClear || "").trim();
   if (quote) {
     lines.push("");
+    // quotedClear may already include the "Previous message" label.
+    if (!/^----- (Previous|Original) message/i.test(quote)) {
+      lines.push("----- Previous message (decrypted) -----");
+    }
     lines.push(quote);
   }
   return lines.join("\n");

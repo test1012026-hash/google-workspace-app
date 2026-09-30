@@ -105,6 +105,9 @@ function apiRequest(baseUrl, path, options) {
     method: options.method || "GET",
     headers: headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    credentials: "omit",
+    cache: "no-store",
+    mode: "cors",
   }).then(function (res) {
     return res.text().then(function (text) {
       return {

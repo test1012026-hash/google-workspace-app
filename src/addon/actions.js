@@ -67,8 +67,14 @@ function onCardGoogleSignIn_(e) {
     .setOpenLink(
       CardService.newOpenLink()
         .setUrl(url)
+        // FULL_SIZE is required so Google OAuth is not framed (Safari blocks that).
         .setOpenAs(CardService.OpenAs.FULL_SIZE)
         .setOnClose(CardService.OnClose.RELOAD_ADD_ON)
+    )
+    .setNotification(
+      CardService.newNotification().setText(
+        "Complete Google sign-in in the new tab, then return here."
+      )
     )
     .build();
 }
@@ -752,16 +758,18 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
       messageToEncrypt = extractForwardPlainMessage_(quotedClear);
       quotedAppendix = "";
     } else if (quotedClear) {
-      // Reply with new text: keep parent readable, without old metadata.
-      quotedAppendix = isForwardSubject
-        ? ""
-        : extractForwardPlainMessage_(quotedClear);
+      // Reply with new text: encrypt only the new reply; append decrypted parent
+      // in clear so the thread shows encrypted reply + readable parent quote.
+      var parentPlain = extractForwardPlainMessage_(quotedClear);
       if (isForwardSubject) {
         // Forward + typed note: encrypt note + parent plain together for new To.
-        var parentPlain = extractForwardPlainMessage_(quotedClear);
         messageToEncrypt = parentPlain
           ? messageToEncrypt + "\n\n" + parentPlain
           : messageToEncrypt;
+        quotedAppendix = "";
+      } else if (parentPlain) {
+        quotedAppendix = formatDecryptedParentQuote_(parentPlain, subject);
+      } else {
         quotedAppendix = "";
       }
     }
@@ -875,6 +883,25 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
     text: bodyText,
     attachmentName: encAttB64 ? encAttName : "",
     attachmentBase64: encAttB64 || "",
+    inReplyTo:
+      payload.matched && payload.matched.ok
+        ? payload.matched.inReplyTo || ""
+        : "",
+    references:
+      payload.matched && payload.matched.ok
+        ? payload.matched.references || ""
+        : "",
+  };
+
+  var sendDraftMeta = {
+    messageId:
+      payload.matched && payload.matched.ok
+        ? payload.matched.messageId || ""
+        : "",
+    threadId:
+      payload.matched && payload.matched.ok
+        ? payload.matched.threadId || ""
+        : "",
   };
 
   // Encrypt data only: update open draft (no send).
@@ -887,21 +914,11 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
         code: "NO_DRAFT_MATCH",
       };
     }
-    var draftMeta = {
-      messageId:
-        payload.matched && payload.matched.ok
-          ? payload.matched.messageId || ""
-          : "",
-      threadId:
-        payload.matched && payload.matched.ok
-          ? payload.matched.threadId || ""
-          : "",
-    };
     var replaced = gmailReplaceDraftWithEncrypted_(
       oldDraftId,
       mimeOpts,
       accessToken,
-      draftMeta
+      sendDraftMeta
     );
     if (!replaced.ok) {
       return {
@@ -926,11 +943,12 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
     };
   }
 
-  // 1) Create encrypted draft → 2) send → 3) delete plaintext draft
+  // 1) Update/create encrypted draft in the same thread → 2) send → 3) cleanup
   var flow = gmailCreateEncryptedDraftSendAndCleanup_(
     oldDraftId,
     mimeOpts,
-    accessToken
+    accessToken,
+    sendDraftMeta
   );
 
   if (flow.ok && flow.sent) {
@@ -943,13 +961,18 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
       firstTo: payload.firstTo,
       subject: subject,
       bodyHtml: bodyHtml,
+      threaded: Boolean(flow.threaded || sendDraftMeta.threadId),
     };
     rememberComposeSendSuccess_(okResult);
     return okResult;
   }
 
-  // Fallback: messages.send, then delete old plaintext draft
-  var sendRes = gmailMessagesSendWithToken_(accessToken, mimeOpts);
+  // Fallback: messages.send with threadId, then delete old plaintext draft
+  var sendRes = gmailMessagesSendWithToken_(
+    accessToken,
+    mimeOpts,
+    sendDraftMeta
+  );
   if (!sendRes.ok) {
     return {
       ok: false,
@@ -988,6 +1011,7 @@ function runComposeEncryptAndSendCoreUnlocked_(e, opts) {
     firstTo: payload.firstTo,
     subject: subject,
     bodyHtml: bodyHtml,
+    threaded: Boolean(sendDraftMeta.threadId),
   };
   rememberComposeSendSuccess_(fallbackOk);
   return fallbackOk;
@@ -1059,28 +1083,11 @@ function finishComposeInSidebar_(e, kind, message) {
 }
 
 /**
- * After Encrypt & send (Workspace-only): update sidebar and open Gmail Inbox.
- * CardService cannot click Discard in the compose DOM; navigating to Inbox
- * dismisses the open compose window without using the Chrome extension.
+ * After Encrypt & send: update sidebar only.
+ * Do not open Gmail Inbox / a new mail window (OpenLink FULL_SIZE).
  */
 function finishComposeSendAndCloseCompose_(e, message) {
-  saveComposeSidebarStatus_("success", message);
-  var toast = ("✔ " + String(message || "Encrypted mail sent."))
-    .replace(/\n/g, " ")
-    .slice(0, 220);
-
-  return CardService.newActionResponseBuilder()
-    .setNotification(CardService.newNotification().setText(toast))
-    .setNavigation(
-      CardService.newNavigation().updateCard(buildMainCard_(e))
-    )
-    .setOpenLink(
-      CardService.newOpenLink()
-        .setUrl("https://mail.google.com/mail/u/0/#inbox")
-        .setOpenAs(CardService.OpenAs.FULL_SIZE)
-        .setOnClose(CardService.OnClose.RELOAD)
-    )
-    .build();
+  return finishComposeInSidebar_(e, "success", message);
 }
 
 /**
@@ -1399,14 +1406,30 @@ function buildSecureComposeBodyHtml_(cipher, meta, quotedClear) {
   var quote = String(quotedClear || "").trim();
   if (quote) {
     parts.push(
-      '<div style="margin-top:16px;padding-top:12px;border-top:1px solid #dadce0;color:#5f6368;font-size:12px;line-height:1.45;white-space:pre-wrap">' +
+      '<div style="margin-top:18px;padding-top:12px;border-top:1px solid #dadce0;color:#5f6368;font-size:12px;line-height:1.45">' +
+        '<div style="margin:0 0 8px 0;font-weight:600;color:#80868b">Previous message (decrypted)</div>' +
+        '<blockquote style="margin:0;padding:0 0 0 12px;border-left:3px solid #dadce0;white-space:pre-wrap">' +
         escapeHtml_(quote).replace(/\n/g, "<br>") +
-        "</div>"
+        "</blockquote></div>"
     );
   }
 
   parts.push("</div>");
   return parts.join("");
+}
+
+/**
+ * Plain quote of decrypted parent under the encrypted reply (not re-encrypted).
+ */
+function formatDecryptedParentQuote_(parentPlain, subject) {
+  var plain = String(parentPlain || "").trim();
+  if (!plain) return "";
+  var label = "----- Previous message (decrypted) -----";
+  var subj = String(subject || "").trim();
+  if (/^re\s*:/i.test(subj)) {
+    label = "----- Original message (decrypted) -----";
+  }
+  return label + "\n" + plain;
 }
 
 /**
