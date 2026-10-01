@@ -1,5 +1,5 @@
 const ADMIN_URL = "https://rakksha.in";
-const API_BASE = "https://server-nine-rosy.vercel.app/api";
+const API_BASE = "https://rakksha.in/api";
 const APP_ORIGIN = API_BASE.replace(/\/api\/?$/, "");
 const SESSION_KEY = "SDS_WORKSPACE_SESSION";
 const WEB_APP_DEPLOYMENT_ID =

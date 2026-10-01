@@ -1,10 +1,10 @@
 (function (g) {
   const ENV = {
-    API_BASE_URL: "https://server-nine-rosy.vercel.app/api",
+    API_BASE_URL: "https://rakksha.in/api",
     LOGIN_WEB_URL: "https://rakksha.in/login",
     TERMS_URL: "https://rakksha.in/terms",
     SESSION_STORAGE_KEY: "securedoc_workspace_session",
-    OAUTH_POPUP_DONE_ORIGIN: "https://server-nine-rosy.vercel.app",
+    OAUTH_POPUP_DONE_ORIGIN: "https://rakksha.in",
     LS_LOGIN_URL_KEY: "securedoc_login_url",
     LS_API_BASE_KEY: "securedoc_api_base",
   };

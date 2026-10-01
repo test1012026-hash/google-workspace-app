@@ -8,7 +8,7 @@ function getApiBaseUrl() {
   }
   return (
     (typeof DEFAULT_API_BASE !== "undefined" && DEFAULT_API_BASE) ||
-    "https://server-nine-rosy.vercel.app/api"
+    "https://rakksha.in/api"
   );
 }
 
