@@ -1,4 +1,4 @@
-const ADMIN_URL = "https://admin-panel-amber-nine.vercel.app";
+const ADMIN_URL = "https://rakksha.in";
 const API_BASE = "https://server-nine-rosy.vercel.app/api";
 const APP_ORIGIN = API_BASE.replace(/\/api\/?$/, "");
 const SESSION_KEY = "SDS_WORKSPACE_SESSION";
@@ -2739,7 +2739,7 @@ function buildSecureComposeBodyHtml_(cipher, meta, quotedClear) {
     parts.push("</div>");
   }
 
-  var siteUrl = String(ADMIN_URL || "https://admin-panel-amber-nine.vercel.app").replace(
+  var siteUrl = String(ADMIN_URL || "https://rakksha.in").replace(
     /\/$/,
     ""
   );
@@ -4615,7 +4615,7 @@ function buildSecureComposeBodyText_(cipher, meta, quotedClear) {
       String(
         typeof ADMIN_URL !== "undefined" && ADMIN_URL
           ? ADMIN_URL
-          : "https://admin-panel-amber-nine.vercel.app"
+          : "https://rakksha.in"
       ).replace(/\/$/, "")
   );
   const quote = String(quotedClear || "").trim();

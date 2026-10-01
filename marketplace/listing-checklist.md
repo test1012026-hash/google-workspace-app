@@ -9,7 +9,7 @@ Use with the Apps Script add-on in the parent folder.
 - [ ] Public HTTPS logo (128×128 or larger)
 - [ ] 1–2 screenshots of the add-on card
 - [ ] Support email on your domain
-- [ ] Privacy / Terms URL (example: https://admin-panel-amber-nine.vercel.app/terms)
+- [ ] Privacy / Terms URL (example: https://rakksha.in/terms)
 
 ## Cloud + SDK
 
@@ -28,7 +28,7 @@ Use with the Apps Script add-on in the parent folder.
 - [ ] Open listing as a user in your org
 - [ ] Install add-on
 - [ ] Confirm Gmail side panel shows **SecureDocShare** with logo
-- [ ] Logo URL live: https://admin-panel-amber-nine.vercel.app/securedoc/icon-128.png
+- [ ] Logo URL live: https://rakksha.in/securedoc/icon-128.png
 - [ ] Admin install for OU (optional): https://admin.google.com → Apps → Google Workspace Marketplace apps
 
 ## Official docs

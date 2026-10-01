@@ -1389,7 +1389,7 @@ function buildSecureComposeBodyHtml_(cipher, meta, quotedClear) {
     parts.push("</div>");
   }
 
-  var siteUrl = String(ADMIN_URL || "https://admin-panel-amber-nine.vercel.app").replace(
+  var siteUrl = String(ADMIN_URL || "https://rakksha.in").replace(
     /\/$/,
     ""
   );

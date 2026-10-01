@@ -974,7 +974,7 @@ function buildSecureComposeBodyText_(cipher, meta, quotedClear) {
       String(
         typeof ADMIN_URL !== "undefined" && ADMIN_URL
           ? ADMIN_URL
-          : "https://admin-panel-amber-nine.vercel.app"
+          : "https://rakksha.in"
       ).replace(/\/$/, "")
   );
   const quote = String(quotedClear || "").trim();

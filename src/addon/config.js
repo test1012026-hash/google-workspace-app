@@ -1,4 +1,4 @@
-const ADMIN_URL = "https://admin-panel-amber-nine.vercel.app";
+const ADMIN_URL = "https://rakksha.in";
 const API_BASE = "https://server-nine-rosy.vercel.app/api";
 const APP_ORIGIN = API_BASE.replace(/\/api\/?$/, "");
 const SESSION_KEY = "SDS_WORKSPACE_SESSION";
